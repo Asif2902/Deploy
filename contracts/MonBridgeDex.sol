@@ -201,58 +201,89 @@ contract MonBridgeDex {
         TradeRoute memory bestRoute;
         bestRoute.inputToken = inputToken;
         bestRoute.outputToken = outputToken;
+        expectedOut = 0;
         
-        // Try direct route first - already checks if canUseTokenInRoute
-        (uint directOutput, Split[] memory directSplits) = findBestSplitForHop(
-            amountIn,
-            inputToken,
-            outputToken,
-            new address[](0)
-        );
-
-        if (directOutput > 0) {
-            bestRoute.hops = 1;
-            bestRoute.splitRoutes = new Split[][](1);
-            bestRoute.splitRoutes[0] = directSplits;
-            expectedOut = directOutput;
-        }
-
-        // Try router-specific unique paths (might find better paths than generic approach)
-        uint uniquePathOutput = findBestRouterSpecificPaths(
-            amountIn,
-            inputToken,
-            outputToken
-        );
-
-        if (uniquePathOutput > expectedOut && 
-            ((uniquePathOutput - expectedOut) * 10000 / (expectedOut > 0 ? expectedOut : 1)) >= SPLIT_THRESHOLD_BPS) {
-            expectedOut = uniquePathOutput;
-            // Note: The route structure is updated inside findBestRouterSpecificPaths
-            // We should return this specific route
-        }
-
-        // Try multi-hop routes (2-4 hops)
-        for (uint hops = 2; hops <= MAX_HOPS; hops++) {
-            (uint hopOutput, TradeRoute memory hopRoute) = findBestMultiHopRoute(
+        // Try direct route first
+        try {
+            (uint directOutput, Split[] memory directSplits) = findBestSplitForHop(
                 amountIn,
                 inputToken,
                 outputToken,
-                hops,
-                new address[](0) 
+                new address[](0)
             );
 
-            if (hopOutput > expectedOut && 
-                ((hopOutput - expectedOut) * 10000 / (expectedOut > 0 ? expectedOut : 1)) >= SPLIT_THRESHOLD_BPS) {
-                bestRoute = hopRoute;
-                expectedOut = hopOutput;
+            if (directOutput > 0 && directSplits.length > 0) {
+                bestRoute.hops = 1;
+                bestRoute.splitRoutes = new Split[][](1);
+                bestRoute.splitRoutes[0] = directSplits;
+                expectedOut = directOutput;
+                
+                // If we find a good direct route, return it immediately to save gas
+                if (expectedOut > amountIn / 2) {
+                    return (bestRoute, expectedOut);
+                }
             }
+        } catch {
+            // Continue if direct route fails
         }
 
-        // Try routes through stablecoins (often have good liquidity)
-        address[] memory commonStablecoins = getCommonStablecoins();
-        for (uint i = 0; i < commonStablecoins.length; i++) {
-            address stablecoin = commonStablecoins[i];
-            if (stablecoin != address(0) && stablecoin != inputToken && stablecoin != outputToken && isWhitelisted(stablecoin)) {
+        // Try two-hop route through WETH if neither token is WETH
+        if (inputToken != WETH && outputToken != WETH) {
+            try {
+                (address inToWethRouter, uint wethOutput) = findBestRouterForPair(
+                    amountIn,
+                    inputToken,
+                    WETH
+                );
+                
+                if (wethOutput > 0 && inToWethRouter != address(0)) {
+                    (address wethToOutRouter, uint finalOutput) = findBestRouterForPair(
+                        wethOutput,
+                        WETH,
+                        outputToken
+                    );
+                    
+                    if (finalOutput > 0 && wethToOutRouter != address(0) && finalOutput > expectedOut) {
+                        TradeRoute memory wethRoute;
+                        wethRoute.inputToken = inputToken;
+                        wethRoute.outputToken = outputToken;
+                        wethRoute.hops = 2;
+                        wethRoute.splitRoutes = new Split[][](2);
+                        
+                        // First hop
+                        wethRoute.splitRoutes[0] = new Split[](1);
+                        wethRoute.splitRoutes[0][0] = Split({
+                            router: inToWethRouter,
+                            percentage: 10000, // 100%
+                            path: getPath(inputToken, WETH)
+                        });
+                        
+                        // Second hop
+                        wethRoute.splitRoutes[1] = new Split[](1);
+                        wethRoute.splitRoutes[1][0] = Split({
+                            router: wethToOutRouter,
+                            percentage: 10000, // 100%
+                            path: getPath(WETH, outputToken)
+                        });
+                        
+                        bestRoute = wethRoute;
+                        expectedOut = finalOutput;
+                    }
+                }
+            } catch {
+                // Continue if WETH route fails
+            }
+        }
+        
+        // Try stablecoin routes with a more efficient approach
+        try {
+            address[] memory stablecoins = getCommonStablecoins();
+            for (uint i = 0; i < stablecoins.length && i < 2; i++) {  // Limit to first 2 stablecoins to save gas
+                address stablecoin = stablecoins[i];
+                if (stablecoin == address(0) || stablecoin == inputToken || stablecoin == outputToken || !isWhitelisted(stablecoin)) {
+                    continue;
+                }
+                
                 (address bestRouterFirst, uint firstHopOutput) = findBestRouterForPair(
                     amountIn,
                     inputToken,
@@ -260,89 +291,60 @@ contract MonBridgeDex {
                 );
 
                 if (firstHopOutput > 0 && bestRouterFirst != address(0)) {
-                    (uint secondHopOutput, Split[] memory secondHopSplits) = findBestSplitForHop(
+                    (address bestRouterSecond, uint secondHopOutput) = findBestRouterForPair(
                         firstHopOutput,
                         stablecoin,
-                        outputToken,
-                        new address[](0)
+                        outputToken
                     );
 
-                    if (secondHopOutput > expectedOut && 
-                        ((secondHopOutput - expectedOut) * 10000 / (expectedOut > 0 ? expectedOut : 1)) >= SPLIT_THRESHOLD_BPS) {
+                    if (secondHopOutput > expectedOut && bestRouterSecond != address(0)) {
                         TradeRoute memory newRoute;
                         newRoute.inputToken = inputToken;
                         newRoute.outputToken = outputToken;
                         newRoute.hops = 2;
                         newRoute.splitRoutes = new Split[][](2);
+                        
+                        // First hop
                         newRoute.splitRoutes[0] = new Split[](1);
                         newRoute.splitRoutes[0][0] = Split({
                             router: bestRouterFirst,
                             percentage: 10000, // 100%
                             path: getPath(inputToken, stablecoin)
                         });
-
-                        newRoute.splitRoutes[1] = secondHopSplits;
+                        
+                        // Second hop
+                        newRoute.splitRoutes[1] = new Split[](1);
+                        newRoute.splitRoutes[1][0] = Split({
+                            router: bestRouterSecond,
+                            percentage: 10000, // 100%
+                            path: getPath(stablecoin, outputToken)
+                        });
 
                         bestRoute = newRoute;
                         expectedOut = secondHopOutput;
                     }
                 }
             }
+        } catch {
+            // Continue if stablecoin routes fail
         }
-
-        // Try finding a good route through whitelisted tokens
-        address[] memory potentialIntermediates = getAllWhitelistedTokens();
-
-        for (uint i = 0; i < potentialIntermediates.length && i < 20; i++) {
-            address intermediateToken = potentialIntermediates[i];
-
-            if (intermediateToken != address(0) && 
-                intermediateToken != inputToken && 
-                intermediateToken != outputToken && 
-                isWhitelisted(intermediateToken)) {
-                
-                (address bestRouterFirstHop, uint firstHopOutput) = findBestRouterForPair(
+        
+        // Only try two-hop route with custom method if we haven't found a good route yet
+        if (expectedOut == 0 || expectedOut < amountIn / 2) {
+            try {
+                (uint twoHopOutput, TradeRoute memory twoHopRoute) = findBestTwoHopRoute(
                     amountIn,
                     inputToken,
-                    intermediateToken
+                    outputToken,
+                    new address[](0)
                 );
-
-                if (firstHopOutput > 0 && bestRouterFirstHop != address(0)) {
-                    (address bestRouterSecondHop, uint secondHopOutput) = findBestRouterForPair(
-                        firstHopOutput,
-                        intermediateToken,
-                        outputToken
-                    );
-
-                    if (secondHopOutput > expectedOut && 
-                        bestRouterSecondHop != address(0) &&
-                        ((secondHopOutput - expectedOut) * 10000 / (expectedOut > 0 ? expectedOut : 1)) >= SPLIT_THRESHOLD_BPS) {
-                        TradeRoute memory newRoute;
-                        newRoute.inputToken = inputToken;
-                        newRoute.outputToken = outputToken;
-                        newRoute.hops = 2;
-                        newRoute.splitRoutes = new Split[][](2);
-
-                        // Set up first hop
-                        newRoute.splitRoutes[0] = new Split[](1);
-                        newRoute.splitRoutes[0][0] = Split({
-                            router: bestRouterFirstHop,
-                            percentage: 10000, // 100%
-                            path: getPath(inputToken, intermediateToken)
-                        });
-
-                        // Set up second hop
-                        newRoute.splitRoutes[1] = new Split[](1);
-                        newRoute.splitRoutes[1][0] = Split({
-                            router: bestRouterSecondHop,
-                            percentage: 10000, // 100%
-                            path: getPath(intermediateToken, outputToken)
-                        });
-
-                        bestRoute = newRoute;
-                        expectedOut = secondHopOutput;
-                    }
+                
+                if (twoHopOutput > expectedOut && twoHopRoute.hops > 0) {
+                    bestRoute = twoHopRoute;
+                    expectedOut = twoHopOutput;
                 }
+            } catch {
+                // Continue if two-hop route fails
             }
         }
 
@@ -1047,11 +1049,6 @@ contract MonBridgeDex {
         // Validate token address
         if (token == address(0)) return false;
         
-        // Check if token is in forbidden list
-        for (uint i = 0; i < forbiddenTokens.length; i++) {
-            if (token == forbiddenTokens[i]) return false;
-        }
-
         // Allow if token is the input or output token for the current transaction
         // This allows complex routes like X→Y→X→Z where X is not whitelisted
         if (token == inputToken || token == outputToken) {
@@ -1063,10 +1060,15 @@ contract MonBridgeDex {
             return true;
         }
         
+        // Check if token is in forbidden list (only if we have forbidden tokens)
+        if (forbiddenTokens.length > 0) {
+            for (uint i = 0; i < forbiddenTokens.length; i++) {
+                if (token == forbiddenTokens[i]) return false;
+            }
+        }
+        
         // Otherwise, must be whitelisted
-        if (!isWhitelisted(token)) return false;
-
-        return true;
+        return isWhitelisted(token);
     }
 
 
@@ -1095,7 +1097,9 @@ contract MonBridgeDex {
     function getPath(address tokenIn, address tokenOut) internal view returns (address[] memory) {
         // Input validation
         if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut) {
-            address[] memory emptyPath = new address[](0);
+            address[] memory emptyPath = new address[](2);
+            emptyPath[0] = tokenIn;
+            emptyPath[1] = tokenOut;
             return emptyPath;
         }
         
@@ -1104,86 +1108,69 @@ contract MonBridgeDex {
         directPath[0] = tokenIn;
         directPath[1] = tokenOut;
         
-        // If either token is WETH or both are whitelisted, check direct path first
-        if (tokenIn == WETH || tokenOut == WETH || (isWhitelisted(tokenIn) && isWhitelisted(tokenOut))) {
-            // Verify if direct path has liquidity
-            bool hasDirectLiquidity = false;
+        // Always check direct path first, it's the most efficient
+        bool hasDirectLiquidity = false;
+        for (uint i = 0; i < routers.length && !hasDirectLiquidity; i++) {
+            if (routers[i] == address(0)) continue;
             
-            for (uint i = 0; i < routers.length && !hasDirectLiquidity; i++) {
-                if (routers[i] == address(0)) continue;
-                
-                try IUniswapV2Router02(routers[i]).getAmountsOut(1, directPath) returns (uint[] memory amounts) {
-                    if (amounts.length > 1 && amounts[amounts.length - 1] > 0) {
-                        hasDirectLiquidity = true;
-                    }
-                } catch {
-                    // Continue checking other routers
+            try IUniswapV2Router02(routers[i]).getAmountsOut(1, directPath) returns (uint[] memory amounts) {
+                if (amounts.length > 1 && amounts[amounts.length - 1] > 0) {
+                    hasDirectLiquidity = true;
                 }
-            }
-            
-            if (hasDirectLiquidity) {
-                return directPath;
+            } catch {
+                // Continue checking other routers
             }
         }
         
-        // For any tokens without direct path, try to find the best intermediate
+        if (hasDirectLiquidity) {
+            return directPath;
+        }
         
-        // First try WETH as intermediate (most common)
+        // Try WETH as intermediate (most common)
         if (tokenIn != WETH && tokenOut != WETH) {
             address[] memory wethPath = new address[](3);
             wethPath[0] = tokenIn;
             wethPath[1] = WETH;
             wethPath[2] = tokenOut;
             
-            bool hasWethPathLiquidity = false;
-            for (uint i = 0; i < routers.length && !hasWethPathLiquidity; i++) {
+            for (uint i = 0; i < routers.length; i++) {
                 if (routers[i] == address(0)) continue;
                 
                 try IUniswapV2Router02(routers[i]).getAmountsOut(1, wethPath) returns (uint[] memory amounts) {
                     if (amounts.length > 2 && amounts[amounts.length - 1] > 0) {
-                        hasWethPathLiquidity = true;
+                        return wethPath;
                     }
                 } catch {
                     // Continue checking other routers
                 }
             }
-            
-            if (hasWethPathLiquidity) {
-                return wethPath;
-            }
         }
         
-        // Try stablecoins as intermediates
+        // Try only the first stablecoin as intermediate to save gas
         address[] memory stablecoins = getCommonStablecoins();
-        for (uint i = 0; i < stablecoins.length; i++) {
-            address stablecoin = stablecoins[i];
+        if (stablecoins.length > 0) {
+            address stablecoin = stablecoins[0];
             if (stablecoin != address(0) && stablecoin != tokenIn && stablecoin != tokenOut) {
                 address[] memory stablePath = new address[](3);
                 stablePath[0] = tokenIn;
                 stablePath[1] = stablecoin;
                 stablePath[2] = tokenOut;
                 
-                bool hasStablePathLiquidity = false;
-                for (uint j = 0; j < routers.length && !hasStablePathLiquidity; j++) {
+                for (uint j = 0; j < routers.length; j++) {
                     if (routers[j] == address(0)) continue;
                     
                     try IUniswapV2Router02(routers[j]).getAmountsOut(1, stablePath) returns (uint[] memory amounts) {
                         if (amounts.length > 2 && amounts[amounts.length - 1] > 0) {
-                            hasStablePathLiquidity = true;
+                            return stablePath;
                         }
                     } catch {
                         // Continue checking other routers
                     }
                 }
-                
-                if (hasStablePathLiquidity) {
-                    return stablePath;
-                }
             }
         }
         
-        // If no path with liquidity found, return direct path as fallback
-        // (this will likely fail later but we let the caller handle that)
+        // Return direct path as fallback
         return directPath;
     }
 
@@ -1725,15 +1712,16 @@ contract MonBridgeDex {
         bestAmountOut = 0;
         bestRouter = address(0);
 
-        // Try direct path first
+        // Get direct path once to avoid repeated calls
+        address[] memory directPath = new address[](2);
+        directPath[0] = tokenIn;
+        directPath[1] = tokenOut;
+
+        // Try direct path first with all routers
         for (uint i = 0; i < routers.length; i++) {
             if (routers[i] == address(0)) continue;
             
-            address[] memory path = getPath(tokenIn, tokenOut);
-            if (path.length < 2) continue;
-            
-            // Use try/catch to skip routers that revert
-            try IUniswapV2Router02(routers[i]).getAmountsOut(amountIn, path) returns (uint[] memory res) {
+            try IUniswapV2Router02(routers[i]).getAmountsOut(amountIn, directPath) returns (uint[] memory res) {
                 if (res.length > 1) {
                     uint amountOut = res[res.length - 1];
                     if (amountOut > bestAmountOut) {
@@ -1746,44 +1734,31 @@ contract MonBridgeDex {
             }
         }
         
-        // If no direct path works and WETH is neither input nor output, try through WETH
-        if (bestAmountOut == 0 && tokenIn != WETH && tokenOut != WETH) {
+        // If direct path worked, return immediately
+        if (bestAmountOut > 0) {
+            return (bestRouter, bestAmountOut);
+        }
+        
+        // If WETH is neither input nor output, try through WETH
+        if (tokenIn != WETH && tokenOut != WETH) {
+            address[] memory wethPath = new address[](3);
+            wethPath[0] = tokenIn;
+            wethPath[1] = WETH;
+            wethPath[2] = tokenOut;
+            
             for (uint i = 0; i < routers.length; i++) {
-                address router = routers[i];
-                if (router == address(0)) continue;
+                if (routers[i] == address(0)) continue;
                 
-                // Try tokenIn -> WETH
-                uint firstHopOutput = 0;
-                address[] memory pathFirst = getPath(tokenIn, WETH);
-                if (pathFirst.length < 2) continue;
-                
-                try IUniswapV2Router02(router).getAmountsOut(amountIn, pathFirst) returns (uint[] memory res) {
-                    if (res.length > 1) {
-                        firstHopOutput = res[res.length - 1];
+                try IUniswapV2Router02(routers[i]).getAmountsOut(amountIn, wethPath) returns (uint[] memory res) {
+                    if (res.length > 2) {
+                        uint amountOut = res[res.length - 1];
+                        if (amountOut > bestAmountOut) {
+                            bestAmountOut = amountOut;
+                            bestRouter = routers[i];
+                        }
                     }
                 } catch {
-                    continue;
-                }
-                
-                if (firstHopOutput > 0) {
-                    // Try WETH -> tokenOut
-                    address[] memory pathSecond = getPath(WETH, tokenOut);
-                    if (pathSecond.length < 2) continue;
-                    
-                    uint finalOutput = 0;
-                    
-                    try IUniswapV2Router02(router).getAmountsOut(firstHopOutput, pathSecond) returns (uint[] memory res) {
-                        if (res.length > 1) {
-                            finalOutput = res[res.length - 1];
-                        }
-                    } catch {
-                        continue;
-                    }
-                    
-                    if (finalOutput > bestAmountOut) {
-                        bestAmountOut = finalOutput;
-                        bestRouter = router;
-                    }
+                    // Continue to next router
                 }
             }
         }
