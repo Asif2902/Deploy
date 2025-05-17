@@ -204,14 +204,12 @@ contract MonBridgeDex {
         expectedOut = 0;
         
         // Try direct route first
-        try {
-            (uint directOutput, Split[] memory directSplits) = findBestSplitForHop(
-                amountIn,
-                inputToken,
-                outputToken,
-                new address[](0)
-            );
-
+        try this.findBestSplitForHop(
+            amountIn,
+            inputToken,
+            outputToken,
+            new address[](0)
+        ) returns (uint directOutput, Split[] memory directSplits) {
             if (directOutput > 0 && directSplits.length > 0) {
                 bestRoute.hops = 1;
                 bestRoute.splitRoutes = new Split[][](1);
@@ -229,45 +227,47 @@ contract MonBridgeDex {
 
         // Try two-hop route through WETH if neither token is WETH
         if (inputToken != WETH && outputToken != WETH) {
-            try {
-                (address inToWethRouter, uint wethOutput) = findBestRouterForPair(
-                    amountIn,
-                    inputToken,
-                    WETH
-                );
+            try this.findBestRouterForPair(
+                amountIn,
+                inputToken,
+                WETH
+            ) returns (address inToWethRouter, uint wethOutput) {
                 
                 if (wethOutput > 0 && inToWethRouter != address(0)) {
-                    (address wethToOutRouter, uint finalOutput) = findBestRouterForPair(
+                    try this.findBestRouterForPair(
                         wethOutput,
                         WETH,
                         outputToken
-                    );
-                    
-                    if (finalOutput > 0 && wethToOutRouter != address(0) && finalOutput > expectedOut) {
-                        TradeRoute memory wethRoute;
-                        wethRoute.inputToken = inputToken;
-                        wethRoute.outputToken = outputToken;
-                        wethRoute.hops = 2;
-                        wethRoute.splitRoutes = new Split[][](2);
+                    ) returns (address wethToOutRouter, uint finalOutput) {
                         
-                        // First hop
-                        wethRoute.splitRoutes[0] = new Split[](1);
-                        wethRoute.splitRoutes[0][0] = Split({
-                            router: inToWethRouter,
-                            percentage: 10000, // 100%
-                            path: getPath(inputToken, WETH)
-                        });
-                        
-                        // Second hop
-                        wethRoute.splitRoutes[1] = new Split[](1);
-                        wethRoute.splitRoutes[1][0] = Split({
-                            router: wethToOutRouter,
-                            percentage: 10000, // 100%
-                            path: getPath(WETH, outputToken)
-                        });
-                        
-                        bestRoute = wethRoute;
-                        expectedOut = finalOutput;
+                        if (finalOutput > 0 && wethToOutRouter != address(0) && finalOutput > expectedOut) {
+                            TradeRoute memory wethRoute;
+                            wethRoute.inputToken = inputToken;
+                            wethRoute.outputToken = outputToken;
+                            wethRoute.hops = 2;
+                            wethRoute.splitRoutes = new Split[][](2);
+                            
+                            // First hop
+                            wethRoute.splitRoutes[0] = new Split[](1);
+                            wethRoute.splitRoutes[0][0] = Split({
+                                router: inToWethRouter,
+                                percentage: 10000, // 100%
+                                path: getPath(inputToken, WETH)
+                            });
+                            
+                            // Second hop
+                            wethRoute.splitRoutes[1] = new Split[](1);
+                            wethRoute.splitRoutes[1][0] = Split({
+                                router: wethToOutRouter,
+                                percentage: 10000, // 100%
+                                path: getPath(WETH, outputToken)
+                            });
+                            
+                            bestRoute = wethRoute;
+                            expectedOut = finalOutput;
+                        }
+                    } catch {
+                        // Continue if second hop of WETH route fails
                     }
                 }
             } catch {
@@ -276,53 +276,56 @@ contract MonBridgeDex {
         }
         
         // Try stablecoin routes with a more efficient approach
-        try {
-            address[] memory stablecoins = getCommonStablecoins();
+        try this.getCommonStablecoins() returns (address[] memory stablecoins) {
             for (uint i = 0; i < stablecoins.length && i < 2; i++) {  // Limit to first 2 stablecoins to save gas
                 address stablecoin = stablecoins[i];
                 if (stablecoin == address(0) || stablecoin == inputToken || stablecoin == outputToken || !isWhitelisted(stablecoin)) {
                     continue;
                 }
                 
-                (address bestRouterFirst, uint firstHopOutput) = findBestRouterForPair(
+                try this.findBestRouterForPair(
                     amountIn,
                     inputToken,
                     stablecoin
-                );
+                ) returns (address bestRouterFirst, uint firstHopOutput) {
+                    if (firstHopOutput > 0 && bestRouterFirst != address(0)) {
+                        try this.findBestRouterForPair(
+                            firstHopOutput,
+                            stablecoin,
+                            outputToken
+                        ) returns (address bestRouterSecond, uint secondHopOutput) {
+                            if (secondHopOutput > expectedOut && bestRouterSecond != address(0)) {
+                                TradeRoute memory newRoute;
+                                newRoute.inputToken = inputToken;
+                                newRoute.outputToken = outputToken;
+                                newRoute.hops = 2;
+                                newRoute.splitRoutes = new Split[][](2);
+                                
+                                // First hop
+                                newRoute.splitRoutes[0] = new Split[](1);
+                                newRoute.splitRoutes[0][0] = Split({
+                                    router: bestRouterFirst,
+                                    percentage: 10000, // 100%
+                                    path: getPath(inputToken, stablecoin)
+                                });
+                                
+                                // Second hop
+                                newRoute.splitRoutes[1] = new Split[](1);
+                                newRoute.splitRoutes[1][0] = Split({
+                                    router: bestRouterSecond,
+                                    percentage: 10000, // 100%
+                                    path: getPath(stablecoin, outputToken)
+                                });
 
-                if (firstHopOutput > 0 && bestRouterFirst != address(0)) {
-                    (address bestRouterSecond, uint secondHopOutput) = findBestRouterForPair(
-                        firstHopOutput,
-                        stablecoin,
-                        outputToken
-                    );
-
-                    if (secondHopOutput > expectedOut && bestRouterSecond != address(0)) {
-                        TradeRoute memory newRoute;
-                        newRoute.inputToken = inputToken;
-                        newRoute.outputToken = outputToken;
-                        newRoute.hops = 2;
-                        newRoute.splitRoutes = new Split[][](2);
-                        
-                        // First hop
-                        newRoute.splitRoutes[0] = new Split[](1);
-                        newRoute.splitRoutes[0][0] = Split({
-                            router: bestRouterFirst,
-                            percentage: 10000, // 100%
-                            path: getPath(inputToken, stablecoin)
-                        });
-                        
-                        // Second hop
-                        newRoute.splitRoutes[1] = new Split[](1);
-                        newRoute.splitRoutes[1][0] = Split({
-                            router: bestRouterSecond,
-                            percentage: 10000, // 100%
-                            path: getPath(stablecoin, outputToken)
-                        });
-
-                        bestRoute = newRoute;
-                        expectedOut = secondHopOutput;
+                                bestRoute = newRoute;
+                                expectedOut = secondHopOutput;
+                            }
+                        } catch {
+                            // Continue if second hop fails
+                        }
                     }
+                } catch {
+                    // Continue if first hop fails
                 }
             }
         } catch {
@@ -331,13 +334,12 @@ contract MonBridgeDex {
         
         // Only try two-hop route with custom method if we haven't found a good route yet
         if (expectedOut == 0 || expectedOut < amountIn / 2) {
-            try {
-                (uint twoHopOutput, TradeRoute memory twoHopRoute) = findBestTwoHopRoute(
-                    amountIn,
-                    inputToken,
-                    outputToken,
-                    new address[](0)
-                );
+            try this.findBestTwoHopRoute(
+                amountIn,
+                inputToken,
+                outputToken,
+                new address[](0)
+            ) returns (uint twoHopOutput, TradeRoute memory twoHopRoute) {
                 
                 if (twoHopOutput > expectedOut && twoHopRoute.hops > 0) {
                     bestRoute = twoHopRoute;
@@ -1084,7 +1086,7 @@ contract MonBridgeDex {
         return intermediates;
     }
 
-    function getCommonStablecoins() internal pure returns (address[] memory) {
+    function getCommonStablecoins() public pure returns (address[] memory) {
         address[] memory stablecoins = new address[](4);
         // Main stablecoins that typically have good liquidity
         stablecoins[0] = address(0x88b8E2161DEDC77EF4ab7585569D2415a1C1055D); // Major stablecoin 1
@@ -1195,7 +1197,7 @@ contract MonBridgeDex {
         address inputToken,
         address outputToken,
         address[] memory /* forbiddenTokens */
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
+    ) public view returns (uint expectedOut, TradeRoute memory route) {
         require(inputToken != address(0) && outputToken != address(0), "Invalid token addresses");
         require(amountIn > 0, "Amount must be greater than 0");
         
@@ -1623,7 +1625,7 @@ contract MonBridgeDex {
         address tokenIn,
         address tokenOut,
         address[] memory /* forbiddenTokens */
-    ) internal view returns (uint expectedOut, Split[] memory splits) {
+    ) public view returns (uint expectedOut, Split[] memory splits) {
         // Input validation
         if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut || amountIn == 0) {
             return (0, new Split[](0));
@@ -1703,7 +1705,7 @@ contract MonBridgeDex {
         uint amountIn,
         address tokenIn,
         address tokenOut
-    ) internal view returns (address bestRouter, uint bestAmountOut) {
+    ) public view returns (address bestRouter, uint bestAmountOut) {
         // Input validation
         if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut || amountIn == 0) {
             return (address(0), 0);
