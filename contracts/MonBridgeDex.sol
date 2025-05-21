@@ -499,7 +499,7 @@ contract MonBridgeDex {
         if (currentHopIndex == targetHops - 1) {
             // This hop goes from currentTokenIn to finalTokenOut
             (uint hopOutput, Split[] memory hopSplits) = findBestSplitForHop(
-                currentAmountIn, // Use currentAmountIn for this hop calculation
+                originalAmountIn, // Use originalAmountIn (1st param of current func scope) for this hop calculation
                 currentTokenIn,
                 finalTokenOut,
                 pathTokens // Pass pathTokens to findBestSplitForHop if it needs to avoid prior tokens
@@ -549,7 +549,7 @@ contract MonBridgeDex {
 
             // Find best way to get from currentTokenIn to nextIntermediate for the current hop
             (uint hopOutput, Split[] memory hopSplits) = findBestSplitForHop(
-                currentAmountIn,
+                originalAmountIn, // Use originalAmountIn (1st param of current func scope)
                 currentTokenIn,
                 nextIntermediate,
                 pathTokens // Pass pathTokens to avoid direct cycle
