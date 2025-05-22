@@ -1,15 +1,18 @@
-const { ethers, network } = require("hardhat");
-require("dotenv").config();
-const fs = require("fs");
+const hre = require("hardhat"); // replace this line
+// const { ethers, network } = require("hardhat"); <- REMOVE this line
+
+require('dotenv').config();
 
 async function main() {
   console.log("Starting deployment of MonBridgeDex contract...");
 
   const WETH_ADDRESS = process.env.WETH_ADDRESS || "0x760AfE86e5de5fa0Ee542fc7B7B713e1c5425701";
-  const MonBridgeDex = await ethers.getContractFactory("MonBridgeDex");
+
+  // Use hre.ethers directly
+  const MonBridgeDex = await hre.ethers.getContractFactory("MonBridgeDex");
 
   console.log(`Deploying with WETH address: ${WETH_ADDRESS}`);
-  console.log("Network:", network.name);
+  console.log("Network:", hre.network.name);
 
   const dex = await MonBridgeDex.deploy(WETH_ADDRESS);
 
@@ -19,14 +22,15 @@ async function main() {
   await dex.deployed();
 
   console.log(`MonBridgeDex deployed to: ${dex.address}`);
-  console.log("Deployment completed successfully!");
+
+  const fs = require("fs");
 
   const deploymentInfo = {
     contractAddress: dex.address,
-    networkName: network.name,
-    chainId: network.config.chainId,
+    networkName: hre.network.name,
+    chainId: hre.network.config.chainId,
     timestamp: new Date().toISOString(),
-    wethAddress: WETH_ADDRESS,
+    wethAddress: WETH_ADDRESS
   };
 
   if (!fs.existsSync("./deployments")) {
@@ -34,14 +38,16 @@ async function main() {
   }
 
   fs.writeFileSync(
-    `./deployments/${network.name}-deployment.json`,
+    `./deployments/${hre.network.name}-deployment.json`,
     JSON.stringify(deploymentInfo, null, 2)
   );
 
-  console.log(`Deployment info saved to ./deployments/${network.name}-deployment.json`);
+  console.log(`Deployment info saved to ./deployments/${hre.network.name}-deployment.json`);
 }
 
-main().catch((error) => {
-  console.error("Error during deployment:", error);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error("Error during deployment:", error);
+    process.exit(1);
+  });
