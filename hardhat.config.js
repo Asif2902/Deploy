@@ -1,6 +1,6 @@
 require("@nomiclabs/hardhat-waffle");
 require("@nomiclabs/hardhat-ethers");
-require('dotenv').config();
+require("dotenv").config();
 
 /**
  * @type import('hardhat/config').HardhatUserConfig
@@ -11,10 +11,10 @@ module.exports = {
     settings: {
       optimizer: {
         enabled: true,
-        runs: 20000
+        runs: 2000000000,
       },
-      viaIR: true
-    }
+      viaIR: true,
+    },
   },
   networks: {
     // Configure networks here. For example:
@@ -25,13 +25,13 @@ module.exports = {
     monad_testnet: {
       url: process.env.MONAD_TESTNET_RPC || "https://testnet-rpc.monad.xyz",
       chainId: 10143,
-      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
-    }
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+    },
   },
   paths: {
     sources: "./contracts",
     tests: "./test",
     cache: "./cache",
-    artifacts: "./artifacts"
-  }
+    artifacts: "./artifacts",
+  },
 };
