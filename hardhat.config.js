@@ -1,26 +1,37 @@
+require("@nomiclabs/hardhat-waffle");
+require("@nomiclabs/hardhat-ethers");
+require('dotenv').config();
 
-require("@nomicfoundation/hardhat-toolbox");
-import('hardhat/config').HardhatUserConfig
+/**
+ * @type import('hardhat/config').HardhatUserConfig
+ */
 module.exports = {
   solidity: {
-    version: "0.8.26",
+    version: "0.8.18",
     settings: {
-      evmVersion: "shanghai",
       optimizer: {
         enabled: true,
-        runs: 1000,
+        runs: 200
       },
-      viaIR: true,
-    },
+      viaIR: true
+    }
   },
-  defaultNetwork: "localhost",
   networks: {
+    // Configure networks here. For example:
     hardhat: {
-      allowUnlimitedContractSize: true,
+      // Local development network
     },
-    localhost: {
-      allowUnlimitedContractSize: true,
-      url: "http://127.0.0.1:8545/",
-    },
+    // Monad testnet configuration
+    monad_testnet: {
+      url: process.env.MONAD_TESTNET_RPC || "https://testnet-rpc.monad.xyz",
+      chainId: 10143,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
+    }
+  },
+  paths: {
+    sources: "./contracts",
+    tests: "./test",
+    cache: "./cache",
+    artifacts: "./artifacts"
   }
 };
