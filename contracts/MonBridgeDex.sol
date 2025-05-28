@@ -244,7 +244,7 @@ contract MonBridgeDex {
         uint amountIn,
         address inputToken,
         address outputToken
-    ) external view returns (TradeRoute memory route, uint expectedOut) {
+    ) external returns (TradeRoute memory route, uint expectedOut) {
         require(amountIn > 0, "Amount must be greater than 0");
         require(inputToken != address(0) && outputToken != address(0), "Invalid token addresses");
         require(inputToken != outputToken, "Input and output tokens must be different");
@@ -253,6 +253,17 @@ contract MonBridgeDex {
         // Check cache first
         bytes32 cacheKey = keccak256(abi.encodePacked(amountIn, inputToken, outputToken, block.timestamp / cacheTimeout));
         uint cachedOutput = routeCache[cacheKey];
+        
+        // Use cached result if available and valid
+        if (cachedOutput > 0) {
+            // Return a basic route structure for cached results
+            route.inputToken = inputToken;
+            route.outputToken = outputToken;
+            route.hops = 1;
+            route.splitRoutes = new Split[][](1);
+            route.totalExpectedOutput = cachedOutput;
+            return (route, cachedOutput);
+        }
 
         TradeRoute memory bestRoute;
         bestRoute.inputToken = inputToken;
@@ -1190,9 +1201,6 @@ contract MonBridgeDex {
 
         uint bestProfit = 0;
 
-        // Try different combinations of intermediate tokens
-        uint[] memory indices = new uint[](cycleLength - 2);
-        
         // Simple combinatorial approach (limited for gas efficiency)
         for (uint i = 0; i < availableTokens.length && i < 3; i++) {
             if (availableTokens[i] == startToken || availableTokens[i] == endToken) continue;
@@ -1954,7 +1962,7 @@ contract MonBridgeDex {
         uint amountIn,
         address tokenIn,
         address tokenOut,
-        address[] memory forbiddenTokens
+        address[] memory /* forbiddenTokens */
     ) public view returns (uint expectedOut, Split[] memory splits) {
         if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut || amountIn == 0) {
             return (0, new Split[](0));
