@@ -1461,13 +1461,36 @@ contract MonBridgeDex {
             }
             if (alreadyUsed) continue;
 
-            // Calculate liquidity score
+            // Calculate combined liquidity and actual output score
+            uint liquidityScore = 0;
+            uint outputScore = 0;
+            
+            // Test actual swap output through this intermediate
+            address[] memory testPath = new address[](3);
+            testPath[0] = fromToken;
+            testPath[1] = candidates[i];
+            testPath[2] = toToken;
+            
+            for (uint k = 0; k < routers.length; k++) {
+                if (routers[k] == address(0)) continue;
+                
+                try IUniswapV2Router02(routers[k]).getAmountsOut(1000, testPath) returns (uint[] memory amounts) {
+                    if (amounts.length > 2 && amounts[amounts.length - 1] > outputScore) {
+                        outputScore = amounts[amounts.length - 1];
+                    }
+                } catch {}
+            }
+            
+            // Calculate liquidity depth
             uint liquidityIn = analyzeLiquidityDepth(fromToken, candidates[i]);
             uint liquidityOut = analyzeLiquidityDepth(candidates[i], toToken);
-            uint score = sqrt(liquidityIn * liquidityOut);
+            liquidityScore = sqrt(liquidityIn * liquidityOut);
+            
+            // Combined score (70% output, 30% liquidity)
+            uint combinedScore = (outputScore * 7 + liquidityScore * 3) / 10;
 
-            if (score > bestScore) {
-                bestScore = score;
+            if (combinedScore > bestScore) {
+                bestScore = combinedScore;
                 bestToken = candidates[i];
             }
         }
@@ -1720,6 +1743,13 @@ contract MonBridgeDex {
         return whitelistedTokenArray;
     }
     
+    function getCommonStablecoins() internal pure returns (address[] memory) {
+        address[] memory stablecoins = new address[](2);
+        stablecoins[0] = 0xf817257fed379853cDe0fa4F97AB987181B1E5Ea;
+        stablecoins[1] = 0x88b8E2161DEDC77EF4ab7585569D2415a1C1055D;
+        return stablecoins;
+    }
+    
     function getWhitelistedTokensCount() external view returns (uint) {
         return whitelistedTokenArray.length;
     }
@@ -1865,59 +1895,57 @@ contract MonBridgeDex {
         directPath[0] = tokenIn;
         directPath[1] = tokenOut;
 
+        // Check direct path first
         bool hasDirectLiquidity = false;
+        uint bestDirectOutput = 0;
+        
         for (uint i = 0; i < routers.length && !hasDirectLiquidity; i++) {
             if (routers[i] == address(0)) continue;
 
-            try IUniswapV2Router02(routers[i]).getAmountsOut(1, directPath) returns (uint[] memory amounts) {
+            try IUniswapV2Router02(routers[i]).getAmountsOut(1000, directPath) returns (uint[] memory amounts) {
                 if (amounts.length > 1 && amounts[amounts.length - 1] > 0) {
                     hasDirectLiquidity = true;
+                    if (amounts[amounts.length - 1] > bestDirectOutput) {
+                        bestDirectOutput = amounts[amounts.length - 1];
+                    }
                 }
             } catch {}
         }
 
-        if (hasDirectLiquidity) {
-            return directPath;
-        }
+        // Try paths through whitelisted intermediate tokens
+        address[] memory intermediates = getBestIntermediateTokens(tokenIn, tokenOut, 5);
+        uint bestIntermediateOutput = 0;
+        address[] memory bestIntermediatePath;
 
-        if (tokenIn != WETH && tokenOut != WETH) {
-            address[] memory wethPath = new address[](3);
-            wethPath[0] = tokenIn;
-            wethPath[1] = WETH;
-            wethPath[2] = tokenOut;
+        for (uint i = 0; i < intermediates.length; i++) {
+            address intermediate = intermediates[i];
+            if (intermediate == address(0)) continue;
 
-            for (uint i = 0; i < routers.length; i++) {
-                if (routers[i] == address(0)) continue;
+            address[] memory intermediatePath = new address[](3);
+            intermediatePath[0] = tokenIn;
+            intermediatePath[1] = intermediate;
+            intermediatePath[2] = tokenOut;
 
-                try IUniswapV2Router02(routers[i]).getAmountsOut(1, wethPath) returns (uint[] memory amounts) {
-                    if (amounts.length > 2 && amounts[amounts.length - 1] > 0) {
-                        return wethPath;
+            for (uint j = 0; j < routers.length; j++) {
+                if (routers[j] == address(0)) continue;
+
+                try IUniswapV2Router02(routers[j]).getAmountsOut(1000, intermediatePath) returns (uint[] memory amounts) {
+                    if (amounts.length > 2 && amounts[amounts.length - 1] > bestIntermediateOutput) {
+                        bestIntermediateOutput = amounts[amounts.length - 1];
+                        bestIntermediatePath = intermediatePath;
                     }
                 } catch {}
             }
         }
 
-        address[] memory stablecoins = getCommonStablecoins();
-        if (stablecoins.length > 0) {
-            address stablecoin = stablecoins[0];
-            if (stablecoin != address(0) && stablecoin != tokenIn && stablecoin != tokenOut) {
-                address[] memory stablePath = new address[](3);
-                stablePath[0] = tokenIn;
-                stablePath[1] = stablecoin;
-                stablePath[2] = tokenOut;
-
-                for (uint j = 0; j < routers.length; j++) {
-                    if (routers[j] == address(0)) continue;
-
-                    try IUniswapV2Router02(routers[j]).getAmountsOut(1, stablePath) returns (uint[] memory amounts) {
-                        if (amounts.length > 2 && amounts[amounts.length - 1] > 0) {
-                            return stablePath;
-                        }
-                    } catch {}
-                }
-            }
+        // Return the best path found
+        if (hasDirectLiquidity && bestDirectOutput >= bestIntermediateOutput) {
+            return directPath;
+        } else if (bestIntermediateOutput > 0) {
+            return bestIntermediatePath;
         }
 
+        // Fallback to direct path
         return directPath;
     }
 
@@ -2337,7 +2365,8 @@ contract MonBridgeDex {
         require(route.inputToken != address(0) && route.outputToken != address(0), "Invalid tokens");
         require(deadline >= block.timestamp, "Deadline expired");
 
-        // Validate all intermediate tokens are whitelisted
+        // Validate intermediate tokens - only whitelisted tokens can be used as intermediates
+        // Exception: input/output tokens can be used even if not whitelisted
         for (uint i = 0; i < route.hops; i++) {
             for (uint j = 0; j < route.splitRoutes[i].length; j++) {
                 Split memory split = route.splitRoutes[i][j];
@@ -2348,9 +2377,11 @@ contract MonBridgeDex {
                     address token = split.path[k];
                     require(token != address(0), "Invalid token in path");
 
+                    // Allow input and output tokens even if not whitelisted
                     if (token == route.inputToken || token == route.outputToken) {
                         continue;
                     } else {
+                        // All other intermediate tokens must be whitelisted
                         require(isWhitelisted(token), "Intermediate token not whitelisted");
                     }
                 }
