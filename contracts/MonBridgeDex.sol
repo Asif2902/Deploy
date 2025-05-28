@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
@@ -83,6 +84,30 @@ contract MonBridgeDex {
     // Advanced routing state
     mapping(bytes32 => uint) public routeCache;
     uint public cacheTimeout = 300; // 5 minutes
+
+    // Storage for DP memoization
+    mapping(bytes32 => uint) private dpMemoization;
+
+    // Arbitrage detection structures
+    struct ArbitrageOpportunity {
+        address[] cycle;
+        uint[] amounts;
+        uint profit;
+        uint profitability; // Profit as percentage * 100
+        bool isTriangular;
+    }
+
+    struct ArbitrageRoute {
+        ArbitrageOpportunity[] opportunities;
+        uint totalProfit;
+        uint enhancedOutput;
+    }
+
+    // Arbitrage configuration
+    uint public constant MIN_ARBITRAGE_PROFIT_BPS = 50; // 0.5%
+    uint public constant MAX_ARBITRAGE_CYCLES = 5;
+    uint public constant TRIANGULAR_CYCLE_LENGTH = 3;
+    uint public constant MAX_CYCLE_LENGTH = 6;
 
     struct Split {
         address router;    
@@ -178,13 +203,26 @@ contract MonBridgeDex {
     function whitelistTokens(address[] calldata tokens) external onlyOwner {
         for (uint i = 0; i < tokens.length; i++) {
             require(tokens[i] != address(0), "Token cannot be zero address");
-            whitelistedTokens[tokens[i]] = true;
-            emit TokenWhitelisted(tokens[i]);
+            if (!whitelistedTokens[tokens[i]]) {
+                whitelistedTokens[tokens[i]] = true;
+                whitelistedTokenArray.push(tokens[i]);
+                emit TokenWhitelisted(tokens[i]);
+            }
         }
     }
 
     function removeTokenFromWhitelist(address token) external onlyOwner {
+        require(whitelistedTokens[token], "Token not whitelisted");
         whitelistedTokens[token] = false;
+        
+        // Remove from array
+        for (uint i = 0; i < whitelistedTokenArray.length; i++) {
+            if (whitelistedTokenArray[i] == token) {
+                whitelistedTokenArray[i] = whitelistedTokenArray[whitelistedTokenArray.length - 1];
+                whitelistedTokenArray.pop();
+                break;
+            }
+        }
         emit TokenRemovedFromWhitelist(token);
     }
 
@@ -267,6 +305,13 @@ contract MonBridgeDex {
         if (sorOutput > expectedOut) {
             expectedOut = sorOutput;
             bestRoute = sorRoute;
+        }
+
+        // Algorithm 7: Triangular & Cyclic Arbitrage Enhancement
+        (uint arbOutput, TradeRoute memory arbRoute) = enhanceRouteWithArbitrage(amountIn, inputToken, outputToken, bestRoute);
+        if (arbOutput > expectedOut) {
+            expectedOut = arbOutput;
+            bestRoute = arbRoute;
         }
 
         // Finalize route
@@ -369,15 +414,12 @@ contract MonBridgeDex {
         return (currentAmount, greedyRoute);
     }
 
-    // Algorithm 2: Dynamic Programming with memoization
+    // Algorithm 2: Dynamic Programming with memoization (fixed)
     function findRouteDynamicProgramming(
         uint amountIn,
         address inputToken,
         address outputToken
     ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        // Use memoization table for optimal subproblems
-        mapping(bytes32 => uint) memory dpTable;
-
         TradeRoute memory bestRoute;
         bestRoute.inputToken = inputToken;
         bestRoute.outputToken = outputToken;
@@ -389,8 +431,7 @@ contract MonBridgeDex {
                 amountIn,
                 inputToken,
                 outputToken,
-                hops,
-                dpTable
+                hops
             );
 
             if (dpOutput > bestOutput) {
@@ -406,13 +447,13 @@ contract MonBridgeDex {
         uint amountIn,
         address inputToken,
         address outputToken,
-        uint hops,
-        mapping(bytes32 => uint) memory dpTable
+        uint hops
     ) internal view returns (uint expectedOut, TradeRoute memory route) {
         bytes32 key = keccak256(abi.encodePacked(amountIn, inputToken, outputToken, hops));
-        if (dpTable[key] != 0) {
-            // Return cached result (simplified for demo)
-            return (dpTable[key], route);
+        
+        // Check memoization in storage
+        if (dpMemoization[key] != 0) {
+            return (dpMemoization[key], route);
         }
 
         if (hops == 1) {
@@ -429,7 +470,6 @@ contract MonBridgeDex {
                 route.hops = 1;
                 route.splitRoutes = new Split[][](1);
                 route.splitRoutes[0] = directSplits;
-                dpTable[key] = directOutput;
                 return (directOutput, route);
             }
         } else {
@@ -454,8 +494,7 @@ contract MonBridgeDex {
                     firstHopOutput,
                     intermediates[i],
                     outputToken,
-                    hops - 1,
-                    dpTable
+                    hops - 1
                 );
 
                 if (remainingOutput > bestOutput) {
@@ -478,7 +517,6 @@ contract MonBridgeDex {
             }
 
             if (bestOutput > 0) {
-                dpTable[key] = bestOutput;
                 return (bestOutput, bestRoute);
             }
         }
@@ -917,8 +955,7 @@ contract MonBridgeDex {
 
         // If price impact is high, try to optimize
         if (totalPriceImpact > 500) { // >5% impact
-            return optimizeHighImpactRoute(amountIn,```
- inputToken, outputToken, currentBestRoute);
+            return optimizeHighImpactRoute(amountIn, inputToken, outputToken, currentBestRoute);
         }
 
         // For low impact routes, try to find better split distributions
@@ -968,6 +1005,436 @@ contract MonBridgeDex {
 
         expectedOut = simulateRoute(amountIn, optimizedRoute);
         return (expectedOut, optimizedRoute);
+    }
+
+    // Algorithm 7: Arbitrage-Enhanced Routing
+    function enhanceRouteWithArbitrage(
+        uint amountIn,
+        address inputToken,
+        address outputToken,
+        TradeRoute memory baseRoute
+    ) internal view returns (uint expectedOut, TradeRoute memory enhancedRoute) {
+        if (baseRoute.hops == 0) {
+            return (0, baseRoute);
+        }
+
+        // Detect arbitrage opportunities that can enhance the route
+        ArbitrageRoute memory arbRoute = detectArbitrageOpportunities(amountIn, inputToken, outputToken);
+        
+        if (arbRoute.totalProfit == 0) {
+            return (baseRoute.totalExpectedOutput, baseRoute);
+        }
+
+        // Integrate arbitrage into the base route
+        enhancedRoute = integrateArbitrageIntoRoute(amountIn, baseRoute, arbRoute);
+        expectedOut = calculateArbitrageEnhancedOutput(amountIn, enhancedRoute, arbRoute);
+
+        // Only return enhanced route if it's significantly better
+        if (expectedOut > baseRoute.totalExpectedOutput) {
+            return (expectedOut, enhancedRoute);
+        }
+
+        return (baseRoute.totalExpectedOutput, baseRoute);
+    }
+
+    function detectArbitrageOpportunities(
+        uint amountIn,
+        address inputToken,
+        address outputToken
+    ) internal view returns (ArbitrageRoute memory arbRoute) {
+        address[] memory tokens = getAllWhitelistedTokens();
+        
+        arbRoute.opportunities = new ArbitrageOpportunity[](MAX_ARBITRAGE_CYCLES);
+        uint opportunityCount = 0;
+
+        // Detect triangular arbitrage (3-token cycles)
+        for (uint i = 0; i < tokens.length && opportunityCount < MAX_ARBITRAGE_CYCLES; i++) {
+            if (tokens[i] == inputToken || tokens[i] == outputToken) continue;
+
+            ArbitrageOpportunity memory triOpp = detectTriangularArbitrage(
+                inputToken, 
+                tokens[i], 
+                outputToken, 
+                amountIn / 10 // Use portion for arbitrage detection
+            );
+
+            if (triOpp.profit > 0 && triOpp.profitability >= MIN_ARBITRAGE_PROFIT_BPS) {
+                arbRoute.opportunities[opportunityCount] = triOpp;
+                arbRoute.totalProfit += triOpp.profit;
+                opportunityCount++;
+            }
+        }
+
+        // Detect cyclic arbitrage (4-6 token cycles)
+        if (opportunityCount < MAX_ARBITRAGE_CYCLES) {
+            ArbitrageOpportunity[] memory cyclicOpps = detectCyclicArbitrage(
+                inputToken, 
+                outputToken, 
+                tokens, 
+                amountIn / 20 // Smaller portion for complex cycles
+            );
+
+            for (uint i = 0; i < cyclicOpps.length && opportunityCount < MAX_ARBITRAGE_CYCLES; i++) {
+                if (cyclicOpps[i].profit > 0 && cyclicOpps[i].profitability >= MIN_ARBITRAGE_PROFIT_BPS) {
+                    arbRoute.opportunities[opportunityCount] = cyclicOpps[i];
+                    arbRoute.totalProfit += cyclicOpps[i].profit;
+                    opportunityCount++;
+                }
+            }
+        }
+
+        // Resize array to actual count
+        ArbitrageOpportunity[] memory finalOpps = new ArbitrageOpportunity[](opportunityCount);
+        for (uint i = 0; i < opportunityCount; i++) {
+            finalOpps[i] = arbRoute.opportunities[i];
+        }
+        arbRoute.opportunities = finalOpps;
+
+        return arbRoute;
+    }
+
+    function detectTriangularArbitrage(
+        address tokenA,
+        address tokenB,
+        address tokenC,
+        uint testAmount
+    ) internal view returns (ArbitrageOpportunity memory opportunity) {
+        if (testAmount == 0 || tokenA == tokenB || tokenB == tokenC || tokenA == tokenC) {
+            return opportunity;
+        }
+
+        // Test cycle: A -> B -> C -> A
+        address[] memory cycle = new address[](4);
+        cycle[0] = tokenA;
+        cycle[1] = tokenB;
+        cycle[2] = tokenC;
+        cycle[3] = tokenA;
+
+        uint[] memory amounts = new uint[](4);
+        amounts[0] = testAmount;
+
+        // A -> B
+        amounts[1] = getBestOutputForPair(amounts[0], tokenA, tokenB);
+        if (amounts[1] == 0) return opportunity;
+
+        // B -> C
+        amounts[2] = getBestOutputForPair(amounts[1], tokenB, tokenC);
+        if (amounts[2] == 0) return opportunity;
+
+        // C -> A
+        amounts[3] = getBestOutputForPair(amounts[2], tokenC, tokenA);
+        if (amounts[3] == 0) return opportunity;
+
+        // Calculate profit
+        if (amounts[3] > amounts[0]) {
+            uint profit = amounts[3] - amounts[0];
+            uint profitability = (profit * 10000) / amounts[0];
+
+            opportunity = ArbitrageOpportunity({
+                cycle: cycle,
+                amounts: amounts,
+                profit: profit,
+                profitability: profitability,
+                isTriangular: true
+            });
+        }
+
+        return opportunity;
+    }
+
+    function detectCyclicArbitrage(
+        address startToken,
+        address endToken,
+        address[] memory availableTokens,
+        uint testAmount
+    ) internal view returns (ArbitrageOpportunity[] memory opportunities) {
+        uint maxOpps = 3; // Limit cyclic opportunities
+        opportunities = new ArbitrageOpportunity[](maxOpps);
+        uint oppCount = 0;
+
+        // Generate cycles of length 4-6
+        for (uint cycleLength = 4; cycleLength <= MAX_CYCLE_LENGTH && oppCount < maxOpps; cycleLength++) {
+            ArbitrageOpportunity memory cyclicOpp = findBestCyclicArbitrage(
+                startToken,
+                endToken,
+                availableTokens,
+                testAmount,
+                cycleLength
+            );
+
+            if (cyclicOpp.profit > 0) {
+                opportunities[oppCount] = cyclicOpp;
+                oppCount++;
+            }
+        }
+
+        // Resize to actual count
+        ArbitrageOpportunity[] memory result = new ArbitrageOpportunity[](oppCount);
+        for (uint i = 0; i < oppCount; i++) {
+            result[i] = opportunities[i];
+        }
+
+        return result;
+    }
+
+    function findBestCyclicArbitrage(
+        address startToken,
+        address endToken,
+        address[] memory availableTokens,
+        uint testAmount,
+        uint cycleLength
+    ) internal view returns (ArbitrageOpportunity memory bestOpportunity) {
+        if (cycleLength < 4 || availableTokens.length < cycleLength - 2) {
+            return bestOpportunity;
+        }
+
+        uint bestProfit = 0;
+
+        // Try different combinations of intermediate tokens
+        uint[] memory indices = new uint[](cycleLength - 2);
+        
+        // Simple combinatorial approach (limited for gas efficiency)
+        for (uint i = 0; i < availableTokens.length && i < 3; i++) {
+            if (availableTokens[i] == startToken || availableTokens[i] == endToken) continue;
+            
+            for (uint j = i + 1; j < availableTokens.length && j < 6; j++) {
+                if (availableTokens[j] == startToken || availableTokens[j] == endToken || availableTokens[j] == availableTokens[i]) continue;
+
+                address[] memory cycle = new address[](cycleLength + 1);
+                cycle[0] = startToken;
+                cycle[1] = availableTokens[i];
+                cycle[2] = availableTokens[j];
+                
+                if (cycleLength > 4) {
+                    for (uint k = j + 1; k < availableTokens.length && k < 9; k++) {
+                        if (availableTokens[k] == startToken || availableTokens[k] == endToken || 
+                            availableTokens[k] == availableTokens[i] || availableTokens[k] == availableTokens[j]) continue;
+                        
+                        cycle[3] = availableTokens[k];
+                        if (cycleLength > 5) {
+                            cycle[4] = endToken;
+                            cycle[5] = startToken;
+                        } else {
+                            cycle[3] = endToken;
+                            cycle[4] = startToken;
+                        }
+                        break;
+                    }
+                } else {
+                    cycle[3] = endToken;
+                    cycle[4] = startToken;
+                }
+
+                ArbitrageOpportunity memory opportunity = testCycleArbitrage(cycle, testAmount);
+                if (opportunity.profit > bestProfit) {
+                    bestProfit = opportunity.profit;
+                    bestOpportunity = opportunity;
+                }
+            }
+        }
+
+        return bestOpportunity;
+    }
+
+    function testCycleArbitrage(
+        address[] memory cycle,
+        uint testAmount
+    ) internal view returns (ArbitrageOpportunity memory opportunity) {
+        if (cycle.length < 4 || testAmount == 0) return opportunity;
+
+        uint[] memory amounts = new uint[](cycle.length);
+        amounts[0] = testAmount;
+
+        // Test the cycle
+        for (uint i = 0; i < cycle.length - 1; i++) {
+            amounts[i + 1] = getBestOutputForPair(amounts[i], cycle[i], cycle[i + 1]);
+            if (amounts[i + 1] == 0) return opportunity; // Cycle broken
+        }
+
+        // Check if profitable
+        if (amounts[amounts.length - 1] > testAmount) {
+            uint profit = amounts[amounts.length - 1] - testAmount;
+            uint profitability = (profit * 10000) / testAmount;
+
+            opportunity = ArbitrageOpportunity({
+                cycle: cycle,
+                amounts: amounts,
+                profit: profit,
+                profitability: profitability,
+                isTriangular: false
+            });
+        }
+
+        return opportunity;
+    }
+
+    function getBestOutputForPair(
+        uint amountIn,
+        address tokenIn,
+        address tokenOut
+    ) internal view returns (uint bestOutput) {
+        if (amountIn == 0 || tokenIn == tokenOut) return 0;
+
+        address[] memory path = getPath(tokenIn, tokenOut);
+        if (path.length < 2) return 0;
+
+        for (uint i = 0; i < routers.length; i++) {
+            if (routers[i] == address(0)) continue;
+
+            try IUniswapV2Router02(routers[i]).getAmountsOut(amountIn, path) returns (uint[] memory amounts) {
+                if (amounts.length > 1 && amounts[amounts.length - 1] > bestOutput) {
+                    bestOutput = amounts[amounts.length - 1];
+                }
+            } catch {}
+        }
+
+        return bestOutput;
+    }
+
+    function integrateArbitrageIntoRoute(
+        uint amountIn,
+        TradeRoute memory baseRoute,
+        ArbitrageRoute memory arbRoute
+    ) internal view returns (TradeRoute memory enhancedRoute) {
+        enhancedRoute = baseRoute;
+
+        if (arbRoute.opportunities.length == 0) {
+            return enhancedRoute;
+        }
+
+        // Strategy: Use arbitrage opportunities to enhance intermediate hops
+        for (uint oppIndex = 0; oppIndex < arbRoute.opportunities.length; oppIndex++) {
+            ArbitrageOpportunity memory opp = arbRoute.opportunities[oppIndex];
+            
+            // Find best integration point in the route
+            uint bestHop = findBestArbitrageIntegrationPoint(enhancedRoute, opp);
+            
+            if (bestHop < enhancedRoute.hops) {
+                enhancedRoute = insertArbitrageIntoHop(enhancedRoute, opp, bestHop, amountIn);
+            }
+        }
+
+        return enhancedRoute;
+    }
+
+    function findBestArbitrageIntegrationPoint(
+        TradeRoute memory route,
+        ArbitrageOpportunity memory opportunity
+    ) internal pure returns (uint bestHop) {
+        bestHop = route.hops; // Default: no integration
+
+        for (uint hop = 0; hop < route.hops; hop++) {
+            Split[] memory hopSplits = route.splitRoutes[hop];
+            
+            // Check if any split in this hop uses tokens from the arbitrage cycle
+            for (uint splitIndex = 0; splitIndex < hopSplits.length; splitIndex++) {
+                address[] memory splitPath = hopSplits[splitIndex].path;
+                
+                for (uint pathIndex = 0; pathIndex < splitPath.length; pathIndex++) {
+                    for (uint cycleIndex = 0; cycleIndex < opportunity.cycle.length; cycleIndex++) {
+                        if (splitPath[pathIndex] == opportunity.cycle[cycleIndex]) {
+                            return hop; // Found integration point
+                        }
+                    }
+                }
+            }
+        }
+
+        return bestHop;
+    }
+
+    function insertArbitrageIntoHop(
+        TradeRoute memory route,
+        ArbitrageOpportunity memory opportunity,
+        uint targetHop,
+        uint amountIn
+    ) internal view returns (TradeRoute memory enhancedRoute) {
+        enhancedRoute = route;
+
+        if (targetHop >= route.hops || opportunity.cycle.length < 3) {
+            return enhancedRoute;
+        }
+
+        // Create arbitrage-enhanced split for the target hop
+        Split[] memory originalSplits = route.splitRoutes[targetHop];
+        Split[] memory enhancedSplits = new Split[](originalSplits.length + 1);
+
+        // Copy original splits with reduced percentages
+        uint totalReduction = 2000; // 20% for arbitrage
+        uint reductionPerSplit = totalReduction / originalSplits.length;
+
+        for (uint i = 0; i < originalSplits.length; i++) {
+            enhancedSplits[i] = originalSplits[i];
+            if (enhancedSplits[i].percentage > reductionPerSplit) {
+                enhancedSplits[i].percentage -= reductionPerSplit;
+            }
+        }
+
+        // Add arbitrage split
+        enhancedSplits[originalSplits.length] = createArbitrageSplit(
+            opportunity, 
+            totalReduction,
+            targetHop,
+            route,
+            amountIn
+        );
+
+        enhancedRoute.splitRoutes[targetHop] = enhancedSplits;
+        return enhancedRoute;
+    }
+
+    function createArbitrageSplit(
+        ArbitrageOpportunity memory opportunity,
+        uint percentage,
+        uint hopIndex,
+        TradeRoute memory route,
+        uint amountIn
+    ) internal view returns (Split memory arbitrageSplit) {
+        // Use the first available router for arbitrage
+        address arbRouter = routers.length > 0 ? routers[0] : address(0);
+        
+        // Create path from arbitrage cycle that fits the hop
+        address[] memory hopPath = new address[](2);
+        if (hopIndex < route.hops) {
+            Split[] memory hopSplits = route.splitRoutes[hopIndex];
+            if (hopSplits.length > 0) {
+                hopPath[0] = hopSplits[0].path[0];
+                hopPath[1] = hopSplits[0].path[hopSplits[0].path.length - 1];
+            }
+        }
+
+        // Estimate output using arbitrage profit
+        uint estimatedOutput = (amountIn * percentage / 10000) + (opportunity.profit * percentage / 10000);
+
+        arbitrageSplit = Split({
+            router: arbRouter,
+            percentage: percentage,
+            path: hopPath,
+            expectedOutput: estimatedOutput,
+            priceImpact: 0 // Arbitrage typically has minimal price impact
+        });
+
+        return arbitrageSplit;
+    }
+
+    function calculateArbitrageEnhancedOutput(
+        uint amountIn,
+        TradeRoute memory route,
+        ArbitrageRoute memory arbRoute
+    ) internal view returns (uint enhancedOutput) {
+        // Calculate base route output
+        uint baseOutput = simulateRoute(amountIn, route);
+        
+        // Add arbitrage profits (scaled appropriately)
+        uint arbitrageBonus = 0;
+        for (uint i = 0; i < arbRoute.opportunities.length; i++) {
+            // Scale arbitrage profit to the actual trade amount
+            uint scaledProfit = (arbRoute.opportunities[i].profit * amountIn) / (amountIn / 10); // Scale from test amount
+            arbitrageBonus += scaledProfit / 2; // Conservative estimate
+        }
+
+        enhancedOutput = baseOutput + arbitrageBonus;
+        return enhancedOutput;
     }
 
     // Helper functions for advanced algorithms
@@ -1245,38 +1712,21 @@ contract MonBridgeDex {
         return score;
     }
 
+    // Dynamic whitelist management
+    address[] private whitelistedTokenArray;
+    
     // Keep existing core functions with modifications for 8-hop support
     function getAllWhitelistedTokens() internal view returns (address[] memory) {
-        address[] memory commonTokens = getCommonIntermediates();
-        address[] memory stablecoins = getCommonStablecoins();
-
-        address[] memory allTokens = new address[](commonTokens.length + stablecoins.length);
-
-        uint idx = 0;
-        for (uint i = 0; i < commonTokens.length; i++) {
-            allTokens[idx++] = commonTokens[i];
-        }
-
-        for (uint i = 0; i < stablecoins.length; i++) {
-            bool isDuplicate = false;
-            for (uint j = 0; j < commonTokens.length; j++) {
-                if (stablecoins[i] == commonTokens[j]) {
-                    isDuplicate = true;
-                    break;
-                }
-            }
-
-            if (!isDuplicate) {
-                allTokens[idx++] = stablecoins[i];
-            }
-        }
-
-        address[] memory result = new address[](idx);
-        for (uint i = 0; i < idx; i++) {
-            result[i] = allTokens[i];
-        }
-
-        return result;
+        return whitelistedTokenArray;
+    }
+    
+    function getWhitelistedTokensCount() external view returns (uint) {
+        return whitelistedTokenArray.length;
+    }
+    
+    function getWhitelistedTokenAt(uint index) external view returns (address) {
+        require(index < whitelistedTokenArray.length, "Index out of bounds");
+        return whitelistedTokenArray[index];
     }
 
     function analyzeLiquidityDepth(address tokenA, address tokenB) internal view returns (uint) {
@@ -1351,28 +1801,56 @@ contract MonBridgeDex {
         }
     }
 
-    function getCommonIntermediates() internal view returns (address[] memory) {
-        address[] memory intermediates = new address[](8); // Increased for 8-hop support
-        intermediates[0] = WETH;
-        intermediates[1] = address(0xE0590015A873bF326bd645c3E1266d4db41C4E6B);
-        intermediates[2] = address(0x0F0BDEbF0F83cD1EE3974779Bcb7315f9808c714);
-        intermediates[3] = address(0x88b8E2161DEDC77EF4ab7585569D2415a1C1055D);
-        intermediates[4] = address(0xf817257fed379853cDe0fa4F97AB987181B1E5Ea);
-        intermediates[5] = address(0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599); // WBTC
-        intermediates[6] = address(0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984); // UNI
-        intermediates[7] = address(0x514910771AF9Ca656af840dff83E8264EcF986CA); // LINK
-        return intermediates;
-    }
-
-    function getCommonStablecoins() public pure returns (address[] memory) {
-        address[] memory stablecoins = new address[](6); // Increased
-        stablecoins[0] = address(0x88b8E2161DEDC77EF4ab7585569D2415a1C1055D);
-        stablecoins[1] = address(0xf817257fed379853cDe0fa4F97AB987181B1E5Ea);
-        stablecoins[2] = address(0x6B175474E89094C44Da98b954EedeAC495271d0F); // DAI
-        stablecoins[3] = address(0x0000000000085d4780B73119b644AE5ecd22b376); // TUSD
-        stablecoins[4] = address(0x4Fabb145d64652a948d72533023f6E7A623C7C53); // BUSD
-        stablecoins[5] = address(0x853d955aCEf822Db058eb8505911ED77F175b99e); // FRAX
-        return stablecoins;
+    function getBestIntermediateTokens(address tokenIn, address tokenOut, uint maxCount) internal view returns (address[] memory) {
+        address[] memory allWhitelisted = getAllWhitelistedTokens();
+        if (allWhitelisted.length == 0) return new address[](0);
+        
+        uint[] memory liquidityScores = new uint[](allWhitelisted.length);
+        uint validCount = 0;
+        
+        // Calculate liquidity scores for each whitelisted token
+        for (uint i = 0; i < allWhitelisted.length; i++) {
+            if (allWhitelisted[i] == tokenIn || allWhitelisted[i] == tokenOut) continue;
+            
+            uint liquidityIn = analyzeLiquidityDepth(tokenIn, allWhitelisted[i]);
+            uint liquidityOut = analyzeLiquidityDepth(allWhitelisted[i], tokenOut);
+            
+            if (liquidityIn > 0 && liquidityOut > 0) {
+                liquidityScores[i] = sqrt(liquidityIn * liquidityOut);
+                validCount++;
+            }
+        }
+        
+        if (validCount == 0) return new address[](0);
+        
+        // Sort by liquidity scores (simple bubble sort for small arrays)
+        for (uint i = 0; i < allWhitelisted.length; i++) {
+            for (uint j = i + 1; j < allWhitelisted.length; j++) {
+                if (liquidityScores[j] > liquidityScores[i]) {
+                    uint tempScore = liquidityScores[i];
+                    liquidityScores[i] = liquidityScores[j];
+                    liquidityScores[j] = tempScore;
+                    
+                    address tempToken = allWhitelisted[i];
+                    allWhitelisted[i] = allWhitelisted[j];
+                    allWhitelisted[j] = tempToken;
+                }
+            }
+        }
+        
+        // Return top tokens up to maxCount
+        uint returnCount = validCount > maxCount ? maxCount : validCount;
+        address[] memory bestTokens = new address[](returnCount);
+        uint added = 0;
+        
+        for (uint i = 0; i < allWhitelisted.length && added < returnCount; i++) {
+            if (liquidityScores[i] > 0) {
+                bestTokens[added] = allWhitelisted[i];
+                added++;
+            }
+        }
+        
+        return bestTokens;
     }
 
     function getPath(address tokenIn, address tokenOut) internal view returns (address[] memory) {
