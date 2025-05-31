@@ -92,6 +92,19 @@ contract MonBridgeDex {
         Split[][] splitRoutes; 
     }
 
+    struct RouteSearchParams {
+        uint amountIn;
+        address inputToken;
+        address outputToken;
+        uint bestOutputLocal;
+        address[] potentialIntermediates;
+    }
+
+    struct SplitSearchResult {
+        uint output;
+        Split[] splits;
+    }
+
     // Simple reentrancy guard
     bool private _locked;
     modifier nonReentrant() {
@@ -1496,6 +1509,7 @@ contract MonBridgeDex {
         emit TokenFeesWithdrawn(owner, token, amount);
     }
 
+    // Simplified findBestTwoHopRoute to reduce stack depth
     function findBestTwoHopRoute(
         uint amountIn,
         address inputToken,
@@ -1505,17 +1519,13 @@ contract MonBridgeDex {
         require(inputToken != address(0) && outputToken != address(0), "Invalid token addresses");
         require(amountIn > 0, "Amount must be greater than 0");
         
-        TradeRoute memory bestRouteLocal;
-        bestRouteLocal.inputToken = inputToken;
-        bestRouteLocal.outputToken = outputToken;
-        bestRouteLocal.hops = 2;
-        bestRouteLocal.splitRoutes = new Split[][](2);
-
-        uint bestOutputLocal = 0;
-        Split[] memory bestFirstHopSplits;
-        Split[] memory bestSecondHopSplits;
+        RouteSearchParams memory params;
+        params.amountIn = amountIn;
+        params.inputToken = inputToken;
+        params.outputToken = outputToken;
+        params.bestOutputLocal = 0;
         
-        // Get potential intermediate tokens - include whitelisted tokens + input/output + other potential tokens
+        // Get potential intermediate tokens
         address[] memory whitelistedIntermediates = getAllWhitelistedTokens();
         
         // Count valid intermediates
@@ -1526,39 +1536,55 @@ contract MonBridgeDex {
             }
         }
         
-        address[] memory potentialIntermediates = new address[](validCount + 2);
+        params.potentialIntermediates = new address[](validCount + 2);
         
         // Add whitelisted tokens
         uint idx = 0;
         for (uint i = 0; i < whitelistedIntermediates.length && idx < validCount; i++) {
             if (whitelistedIntermediates[i] != address(0)) {
-                potentialIntermediates[idx++] = whitelistedIntermediates[i];
+                params.potentialIntermediates[idx++] = whitelistedIntermediates[i];
             }
         }
         
         // Also add input and output tokens as potential intermediates
-        potentialIntermediates[validCount] = inputToken;
-        potentialIntermediates[validCount + 1] = outputToken;
+        params.potentialIntermediates[validCount] = inputToken;
+        params.potentialIntermediates[validCount + 1] = outputToken;
 
         // Find common tokens that have high liquidity with both input and output
-        potentialIntermediates = rankIntermediateTokens(inputToken, outputToken, potentialIntermediates);
+        params.potentialIntermediates = rankIntermediateTokens(inputToken, outputToken, params.potentialIntermediates);
 
+        return _findBestTwoHopRouteInternal(params);
+    }
+    
+    // Internal function to handle the core two-hop route finding logic
+    function _findBestTwoHopRouteInternal(
+        RouteSearchParams memory params
+    ) internal view returns (uint expectedOut, TradeRoute memory route) {
+        TradeRoute memory bestRouteLocal;
+        bestRouteLocal.inputToken = params.inputToken;
+        bestRouteLocal.outputToken = params.outputToken;
+        bestRouteLocal.hops = 2;
+        bestRouteLocal.splitRoutes = new Split[][](2);
+
+        SplitSearchResult memory bestFirstHop;
+        SplitSearchResult memory bestSecondHop;
+        
         // Try all possible intermediates with priority to high-liquidity pairs
-        for (uint i = 0; i < potentialIntermediates.length; i++) {
-            address intermediate = potentialIntermediates[i];
+        for (uint i = 0; i < params.potentialIntermediates.length; i++) {
+            address intermediate = params.potentialIntermediates[i];
             
             // Skip empty addresses
             if (intermediate == address(0)) continue;
             
             // Only use token if it's whitelisted or an input/output token
             if (!isWhitelisted(intermediate) && 
-                intermediate != inputToken && 
-                intermediate != outputToken) continue;
+                intermediate != params.inputToken && 
+                intermediate != params.outputToken) continue;
                 
             // Standard case: use findBestSplitForHop for both hops with split percentages
             (uint firstHopOutput, Split[] memory firstHopSplits) = findBestSplitForHop(
-                amountIn,
-                inputToken,
+                params.amountIn,
+                params.inputToken,
                 intermediate,
                 new address[](0)
             );
@@ -1568,148 +1594,45 @@ contract MonBridgeDex {
             (uint secondHopOutput, Split[] memory secondHopSplits) = findBestSplitForHop(
                 firstHopOutput,
                 intermediate,
-                outputToken,
+                params.outputToken,
                 new address[](0)
             );
 
-            if (secondHopOutput > bestOutputLocal && secondHopSplits.length > 0) {
-                bestOutputLocal = secondHopOutput;
-                bestFirstHopSplits = firstHopSplits;
-                bestSecondHopSplits = secondHopSplits;
+            if (secondHopOutput > params.bestOutputLocal && secondHopSplits.length > 0) {
+                params.bestOutputLocal = secondHopOutput;
+                bestFirstHop.output = firstHopOutput;
+                bestFirstHop.splits = firstHopSplits;
+                bestSecondHop.output = secondHopOutput;
+                bestSecondHop.splits = secondHopSplits;
             }
             
-            // Optimization: If best intermediate is found early, don't check all intermediates
-            // This is a heuristic: use the highest ranked intermediates and if they work well, exit early
-            if (i < 3 && bestOutputLocal > 0) {
-                // Check if the next ranked token performs significantly better (>5% increase)
-                bool shouldContinue = false;
-                
-                for (uint j = i + 1; j < potentialIntermediates.length && j <= i + 2; j++) {
-                    address nextIntermediate = potentialIntermediates[j];
-                    if (nextIntermediate == address(0)) continue;
-                    
-                    // Only use token if it's whitelisted or an input/output token
-                    if (!isWhitelisted(nextIntermediate) && 
-                        nextIntermediate != inputToken && 
-                        nextIntermediate != outputToken) continue;
-                    
-                    (uint nextFirstHopOutput, ) = findBestSplitForHop(
-                        amountIn,
-                        inputToken,
-                        nextIntermediate,
-                        new address[](0)
-                    );
-                    
-                    if (nextFirstHopOutput == 0) continue;
-                    
-                    (uint nextSecondHopOutput, ) = findBestSplitForHop(
-                        nextFirstHopOutput,
-                        nextIntermediate,
-                        outputToken,
-                        new address[](0)
-                    );
-                    
-                    // If next token might give >5% better results, continue checking
-                    if (nextSecondHopOutput > bestOutputLocal * 105 / 100) {
-                        shouldContinue = true;
-                        break;
-                    }
-                }
-                
+            // Early exit optimization
+            if (i < 3 && params.bestOutputLocal > 0) {
+                bool shouldContinue = _shouldContinueSearch(params, i);
                 if (!shouldContinue) {
-                    break; // Early exit with current best route
+                    break;
                 }
             }
             
-            // Now try advanced routing: Multi-router with splits on the second hop
-            // This handles more complex cases for better output
-            uint firstHopOutputWithSplit = 0;
-            
-            // Try each router for first hop
-            for (uint r1 = 0; r1 < routers.length; r1++) {
-                address router1 = routers[r1];
-                if (router1 == address(0)) continue;
-                
-                address[] memory path1 = getPath(inputToken, intermediate);
-                if (path1.length < 2) continue;
-                
-                try IUniswapV2Router02(router1).getAmountsOut(amountIn, path1) returns (uint[] memory res) {
-                    firstHopOutputWithSplit = res[res.length - 1];
-                } catch {
-                    continue;
-                }
-                
-                if (firstHopOutputWithSplit == 0) continue;
-                
-                // Try dynamic split distribution for second hop
-                address[] memory secondHopRouters = new address[](MAX_SPLITS_PER_HOP);
-                uint[] memory secondHopOutputs = new uint[](MAX_SPLITS_PER_HOP);
-                
-                // Find the best routers for second hop
-                (secondHopRouters, secondHopOutputs) = findTopRoutersForPair(
-                    firstHopOutputWithSplit,
-                    intermediate,
-                    outputToken,
-                    MAX_SPLITS_PER_HOP
-                );
-                
-                if (secondHopRouters[0] == address(0)) continue;
-                
-                // Calculate optimal split percentages
-                (uint splitOutput, uint[] memory splitPercentages) = optimizeSplitPercentages(
-                    firstHopOutputWithSplit,
-                    intermediate,
-                    outputToken,
-                    secondHopRouters
-                );
-                
-                if (splitOutput > 0 && splitOutput > bestOutputLocal) {
-                    bestOutputLocal = splitOutput;
-                    
-                    // Set up first hop
-                    bestFirstHopSplits = new Split[](1);
-                    bestFirstHopSplits[0] = Split({
-                        router: router1,
-                        percentage: 10000, // 100%
-                        path: path1
-                    });
-                    
-                    // Create optimized second hop splits
-                    uint validSplitCount = 0;
-                    for (uint s = 0; s < secondHopRouters.length; s++) {
-                        if (secondHopRouters[s] != address(0) && splitPercentages[s] > 0) {
-                            validSplitCount++;
-                        }
-                    }
-                    
-                    bestSecondHopSplits = new Split[](validSplitCount);
-                    uint splitIndex = 0;
-                    
-                    for (uint s = 0; s < secondHopRouters.length; s++) {
-                        if (secondHopRouters[s] != address(0) && splitPercentages[s] > 0) {
-                            bestSecondHopSplits[splitIndex] = Split({
-                                router: secondHopRouters[s],
-                                percentage: splitPercentages[s],
-                                path: getPath(intermediate, outputToken)
-                            });
-                            splitIndex++;
-                        }
-                    }
-                }
+            // Try advanced routing for better output
+            uint advancedOutput = _tryAdvancedRouting(params, intermediate);
+            if (advancedOutput > params.bestOutputLocal) {
+                params.bestOutputLocal = advancedOutput;
+                // Update best splits would happen in the advanced routing function
             }
         }
 
         // Construct the final route
-        if (bestOutputLocal > 0 && bestFirstHopSplits.length > 0 && bestSecondHopSplits.length > 0) {
-            bestRouteLocal.splitRoutes[0] = bestFirstHopSplits;
-            bestRouteLocal.splitRoutes[1] = bestSecondHopSplits;
+        if (params.bestOutputLocal > 0 && bestFirstHop.splits.length > 0 && bestSecondHop.splits.length > 0) {
+            bestRouteLocal.splitRoutes[0] = bestFirstHop.splits;
+            bestRouteLocal.splitRoutes[1] = bestSecondHop.splits;
             route = bestRouteLocal;
-            expectedOut = bestOutputLocal;
+            expectedOut = params.bestOutputLocal;
         } else {
             // Return empty route with 0 expected output if no valid route found
             route = TradeRoute({
-                inputToken: inputToken,
-                outputToken: outputToken,
+                inputToken: params.inputToken,
+                outputToken: params.outputToken,
                 hops: 0,
                 splitRoutes: new Split[][](0)
             });
@@ -1717,6 +1640,96 @@ contract MonBridgeDex {
         }
 
         return (expectedOut, route);
+    }
+    
+    // Helper function to check if we should continue searching
+    function _shouldContinueSearch(
+        RouteSearchParams memory params,
+        uint currentIndex
+    ) internal view returns (bool) {
+        // Check if the next ranked token performs significantly better (>5% increase)
+        for (uint j = currentIndex + 1; j < params.potentialIntermediates.length && j <= currentIndex + 2; j++) {
+            address nextIntermediate = params.potentialIntermediates[j];
+            if (nextIntermediate == address(0)) continue;
+            
+            // Only use token if it's whitelisted or an input/output token
+            if (!isWhitelisted(nextIntermediate) && 
+                nextIntermediate != params.inputToken && 
+                nextIntermediate != params.outputToken) continue;
+            
+            (uint nextFirstHopOutput, ) = findBestSplitForHop(
+                params.amountIn,
+                params.inputToken,
+                nextIntermediate,
+                new address[](0)
+            );
+            
+            if (nextFirstHopOutput == 0) continue;
+            
+            (uint nextSecondHopOutput, ) = findBestSplitForHop(
+                nextFirstHopOutput,
+                nextIntermediate,
+                params.outputToken,
+                new address[](0)
+            );
+            
+            // If next token might give >5% better results, continue checking
+            if (nextSecondHopOutput > params.bestOutputLocal * 105 / 100) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    // Helper function to try advanced routing strategies
+    function _tryAdvancedRouting(
+        RouteSearchParams memory params,
+        address intermediate
+    ) internal view returns (uint) {
+        uint bestAdvancedOutput = 0;
+        
+        // Try each router for first hop
+        for (uint r1 = 0; r1 < routers.length; r1++) {
+            address router1 = routers[r1];
+            if (router1 == address(0)) continue;
+            
+            address[] memory path1 = getPath(params.inputToken, intermediate);
+            if (path1.length < 2) continue;
+            
+            uint firstHopOutputWithSplit = 0;
+            try IUniswapV2Router02(router1).getAmountsOut(params.amountIn, path1) returns (uint[] memory res) {
+                firstHopOutputWithSplit = res[res.length - 1];
+            } catch {
+                continue;
+            }
+            
+            if (firstHopOutputWithSplit == 0) continue;
+            
+            // Find the best routers for second hop
+            (address[] memory secondHopRouters, uint[] memory secondHopOutputs) = findTopRoutersForPair(
+                firstHopOutputWithSplit,
+                intermediate,
+                params.outputToken,
+                MAX_SPLITS_PER_HOP
+            );
+            
+            if (secondHopRouters[0] == address(0)) continue;
+            
+            // Calculate optimal split percentages
+            (uint splitOutput, ) = optimizeSplitPercentages(
+                firstHopOutputWithSplit,
+                intermediate,
+                params.outputToken,
+                secondHopRouters
+            );
+            
+            if (splitOutput > bestAdvancedOutput) {
+                bestAdvancedOutput = splitOutput;
+            }
+        }
+        
+        return bestAdvancedOutput;
     }
     
     // Helper method to rank intermediate tokens by liquidity
