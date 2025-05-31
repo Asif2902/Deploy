@@ -105,6 +105,11 @@ contract MonBridgeDex {
         Split[] splits;
     }
 
+    struct BestRouteResult {
+        TradeRoute route;
+        uint expectedOut;
+    }
+
     // Simple reentrancy guard
     bool private _locked;
     modifier nonReentrant() {
@@ -204,22 +209,12 @@ contract MonBridgeDex {
         return true;
     }
 
-    function findBestRoute(
-        uint amountIn,
-        address inputToken,
-        address outputToken
-    ) external view returns (TradeRoute memory route, uint expectedOut) {
-        // Input validations
-        require(amountIn > 0, "Amount must be greater than 0");
-        require(inputToken != address(0) && outputToken != address(0), "Invalid token addresses");
-        require(inputToken != outputToken, "Input and output tokens must be different");
-        require(routers.length > 0, "No routers configured");
-
-        // Initialize the trade route
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        expectedOut = 0;
+    // Helper function to try basic routes and return the best one
+    function _tryBasicRoutes(uint amountIn, address inputToken, address outputToken) internal view returns (BestRouteResult memory result) {
+        // Initialize
+        result.route.inputToken = inputToken;
+        result.route.outputToken = outputToken;
+        result.expectedOut = 0;
         
         // Try direct route first
         (uint directOutput, Split[] memory directSplits) = findBestSplitForHop(
@@ -230,17 +225,26 @@ contract MonBridgeDex {
         );
         
         if (directOutput > 0 && directSplits.length > 0) {
-            bestRoute.hops = 1;
-            bestRoute.splitRoutes = new Split[][](1);
-            bestRoute.splitRoutes[0] = directSplits;
-            expectedOut = directOutput;
+            result.route.hops = 1;
+            result.route.splitRoutes = new Split[][](1);
+            result.route.splitRoutes[0] = directSplits;
+            result.expectedOut = directOutput;
             
             // If we find a good direct route, return it immediately to save gas
-            if (expectedOut > amountIn / 2) {
-                return (bestRoute, expectedOut);
+            if (result.expectedOut > amountIn / 2) {
+                return result;
             }
         }
 
+        return result;
+    }
+
+    // Helper function to try WETH routes
+    function _tryWETHRoute(uint amountIn, address inputToken, address outputToken, uint currentBest) internal view returns (BestRouteResult memory result) {
+        result.route.inputToken = inputToken;
+        result.route.outputToken = outputToken;
+        result.expectedOut = currentBest;
+        
         // Try two-hop route through WETH if neither token is WETH
         if (inputToken != WETH && outputToken != WETH) {
             (address inToWethRouter, uint wethOutput) = findBestRouterForPair(
@@ -250,16 +254,14 @@ contract MonBridgeDex {
             );
             
             if (wethOutput > 0 && inToWethRouter != address(0)) {
-                
                 (address wethToOutRouter, uint finalOutput) = findBestRouterForPair(
                     wethOutput,
                     WETH,
                     outputToken
                 );
                 
-                if (finalOutput > 0 && wethToOutRouter != address(0) && finalOutput > expectedOut) {
-                        
-                        TradeRoute memory wethRoute;
+                if (finalOutput > 0 && wethToOutRouter != address(0) && finalOutput > result.expectedOut) {
+                    TradeRoute memory wethRoute;
                     wethRoute.inputToken = inputToken;
                     wethRoute.outputToken = outputToken;
                     wethRoute.hops = 2;
@@ -281,11 +283,20 @@ contract MonBridgeDex {
                         path: getPath(WETH, outputToken)
                     });
                     
-                    bestRoute = wethRoute;
-                    expectedOut = finalOutput;
+                    result.route = wethRoute;
+                    result.expectedOut = finalOutput;
                 }
             }
         }
+        
+        return result;
+    }
+
+    // Helper function to try stablecoin routes
+    function _tryStablecoinRoutes(uint amountIn, address inputToken, address outputToken, uint currentBest) internal view returns (BestRouteResult memory result) {
+        result.route.inputToken = inputToken;
+        result.route.outputToken = outputToken;
+        result.expectedOut = currentBest;
         
         // Try stablecoin routes with popular stablecoins
         address[2] memory stablecoins = [USDT, USDC];
@@ -308,7 +319,7 @@ contract MonBridgeDex {
                     outputToken
                 );
                 
-                if (secondHopOutput > expectedOut && bestRouterSecond != address(0)) {
+                if (secondHopOutput > result.expectedOut && bestRouterSecond != address(0)) {
                     TradeRoute memory newRoute;
                     newRoute.inputToken = inputToken;
                     newRoute.outputToken = outputToken;
@@ -331,17 +342,26 @@ contract MonBridgeDex {
                         path: getPath(stablecoin, outputToken)
                     });
 
-                    bestRoute = newRoute;
-                    expectedOut = secondHopOutput;
+                    result.route = newRoute;
+                    result.expectedOut = secondHopOutput;
                 }
             }
         }
+        
+        return result;
+    }
+
+    // Helper function to try complex multi-hop routes
+    function _tryComplexRoutes(uint amountIn, address inputToken, address outputToken, uint currentBest) internal view returns (BestRouteResult memory result) {
+        result.route.inputToken = inputToken;
+        result.route.outputToken = outputToken;
+        result.expectedOut = currentBest;
         
         // Try progressively more complex routes for maximum output
         // Start with 2-hop routes and go up to 8-hop routes
         for (uint hopCount = 2; hopCount <= MAX_HOPS; hopCount++) {
             // Skip if we already found a very good route (>95% of input value)
-            if (expectedOut > 0 && expectedOut > amountIn * 95 / 100) {
+            if (result.expectedOut > 0 && result.expectedOut > amountIn * 95 / 100) {
                 break;
             }
             
@@ -353,12 +373,9 @@ contract MonBridgeDex {
                 new address[](0)
             );
             
-            if (multiHopOutput > 0) {
-                
-                if (multiHopOutput > expectedOut && multiHopRoute.hops > 0) {
-                    bestRoute = multiHopRoute;
-                    expectedOut = multiHopOutput;
-                }
+            if (multiHopOutput > 0 && multiHopOutput > result.expectedOut && multiHopRoute.hops > 0) {
+                result.route = multiHopRoute;
+                result.expectedOut = multiHopOutput;
             }
             
             // Also try the specialized two-hop route for comparison
@@ -370,15 +387,21 @@ contract MonBridgeDex {
                     new address[](0)
                 );
                 
-                if (twoHopOutput > 0) {
-                    
-                    if (twoHopOutput > expectedOut && twoHopRoute.hops > 0) {
-                        bestRoute = twoHopRoute;
-                        expectedOut = twoHopOutput;
-                    }
+                if (twoHopOutput > 0 && twoHopOutput > result.expectedOut && twoHopRoute.hops > 0) {
+                    result.route = twoHopRoute;
+                    result.expectedOut = twoHopOutput;
                 }
             }
         }
+        
+        return result;
+    }
+
+    // Helper function to try greedy routes
+    function _tryGreedyRoutes(uint amountIn, address inputToken, address outputToken, uint currentBest) internal view returns (BestRouteResult memory result) {
+        result.route.inputToken = inputToken;
+        result.route.outputToken = outputToken;
+        result.expectedOut = currentBest;
         
         // Enhanced greedy search: Try alternative routing strategies
         (uint greedyOutput, TradeRoute memory greedyRoute) = findBestGreedyRoute(
@@ -387,17 +410,46 @@ contract MonBridgeDex {
             outputToken
         );
         
-        if (greedyOutput > 0) {
-            
-            if (greedyOutput > expectedOut && greedyRoute.hops > 0) {
-                bestRoute = greedyRoute;
-                expectedOut = greedyOutput;
-            }
+        if (greedyOutput > 0 && greedyOutput > result.expectedOut && greedyRoute.hops > 0) {
+            result.route = greedyRoute;
+            result.expectedOut = greedyOutput;
         }
+        
+        return result;
+    }
+
+    function findBestRoute(
+        uint amountIn,
+        address inputToken,
+        address outputToken
+    ) external view returns (TradeRoute memory route, uint expectedOut) {
+        // Input validations
+        require(amountIn > 0, "Amount must be greater than 0");
+        require(inputToken != address(0) && outputToken != address(0), "Invalid token addresses");
+        require(inputToken != outputToken, "Input and output tokens must be different");
+        require(routers.length > 0, "No routers configured");
+
+        BestRouteResult memory bestResult;
+        
+        // Try basic routes first
+        bestResult = _tryBasicRoutes(amountIn, inputToken, outputToken);
+        
+        // Try WETH routes
+        bestResult = _tryWETHRoute(amountIn, inputToken, outputToken, bestResult.expectedOut);
+        
+        // Try stablecoin routes
+        bestResult = _tryStablecoinRoutes(amountIn, inputToken, outputToken, bestResult.expectedOut);
+        
+        // Try complex multi-hop routes
+        bestResult = _tryComplexRoutes(amountIn, inputToken, outputToken, bestResult.expectedOut);
+        
+        // Try greedy routes
+        bestResult = _tryGreedyRoutes(amountIn, inputToken, outputToken, bestResult.expectedOut);
 
         // Ensure we have a valid route
-        if (expectedOut > 0 && bestRoute.hops > 0) {
-            route = bestRoute;
+        if (bestResult.expectedOut > 0 && bestResult.route.hops > 0) {
+            route = bestResult.route;
+            expectedOut = bestResult.expectedOut;
         } else {
             // Return empty route with 0 expected output if no valid route found
             route = TradeRoute({
