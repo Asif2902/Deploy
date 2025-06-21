@@ -1013,7 +1013,7 @@ contract MonBridgeDex {
         address outputToken,
         uint hops,
         address[] memory /* forbiddenTokens */
-    ) internal view returns (uint expectedOut, TradeRoute memory bestRoute) {
+    ) public view returns (uint expectedOut, TradeRoute memory bestRoute) {
         require(hops >= 2 && hops <= MAX_HOPS, "Invalid hop count");
         require(inputToken != address(0) && outputToken != address(0), "Invalid token addresses");
         require(amountIn > 0, "Amount must be greater than 0");
