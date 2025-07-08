@@ -76,11 +76,6 @@ contract MonBridgeDex {
     address public WETH;
 
     mapping(address => bool) public whitelistedTokens;
-    mapping(address => bool) public majorTokens;
-    mapping(address => bool) public stablecoins;
-    
-    address[] public majorTokensList;
-    address[] public stablecoinsList;
 
     struct Split {
         address router;    
@@ -113,10 +108,6 @@ contract MonBridgeDex {
     event RouterRemoved(address router);
     event TokenWhitelisted(address token);
     event TokenRemovedFromWhitelist(address token);
-    event MajorTokenAdded(address token);
-    event MajorTokenRemoved(address token);
-    event StablecoinAdded(address token);
-    event StablecoinRemoved(address token);
     event SwapExecuted(address indexed user, uint amountIn, uint amountOut);
     event FeesWithdrawn(address indexed owner, uint ethAmount);
     event TokenFeesWithdrawn(address indexed owner, address token, uint amount);
@@ -169,80 +160,6 @@ contract MonBridgeDex {
         emit TokenRemovedFromWhitelist(token);
     }
 
-    function addMajorTokens(address[] calldata tokens) external onlyOwner {
-        for (uint i = 0; i < tokens.length; i++) {
-            require(tokens[i] != address(0), "Token cannot be zero address");
-            if (!majorTokens[tokens[i]]) {
-                majorTokens[tokens[i]] = true;
-                majorTokensList.push(tokens[i]);
-                // Also whitelist major tokens
-                whitelistedTokens[tokens[i]] = true;
-                emit MajorTokenAdded(tokens[i]);
-                emit TokenWhitelisted(tokens[i]);
-            }
-        }
-    }
-
-    function removeMajorToken(address token) external onlyOwner {
-        if (majorTokens[token]) {
-            majorTokens[token] = false;
-            // Remove from array
-            for (uint i = 0; i < majorTokensList.length; i++) {
-                if (majorTokensList[i] == token) {
-                    majorTokensList[i] = majorTokensList[majorTokensList.length - 1];
-                    majorTokensList.pop();
-                    break;
-                }
-            }
-            emit MajorTokenRemoved(token);
-        }
-    }
-
-    function addStablecoins(address[] calldata tokens) external onlyOwner {
-        for (uint i = 0; i < tokens.length; i++) {
-            require(tokens[i] != address(0), "Token cannot be zero address");
-            if (!stablecoins[tokens[i]]) {
-                stablecoins[tokens[i]] = true;
-                stablecoinsList.push(tokens[i]);
-                // Also whitelist stablecoins
-                whitelistedTokens[tokens[i]] = true;
-                emit StablecoinAdded(tokens[i]);
-                emit TokenWhitelisted(tokens[i]);
-            }
-        }
-    }
-
-    function removeStablecoin(address token) external onlyOwner {
-        if (stablecoins[token]) {
-            stablecoins[token] = false;
-            // Remove from array
-            for (uint i = 0; i < stablecoinsList.length; i++) {
-                if (stablecoinsList[i] == token) {
-                    stablecoinsList[i] = stablecoinsList[stablecoinsList.length - 1];
-                    stablecoinsList.pop();
-                    break;
-                }
-            }
-            emit StablecoinRemoved(token);
-        }
-    }
-
-    function getMajorTokens() external view returns (address[] memory) {
-        return majorTokensList;
-    }
-
-    function getStablecoins() external view returns (address[] memory) {
-        return stablecoinsList;
-    }
-
-    function isMajorToken(address token) public view returns (bool) {
-        return majorTokens[token];
-    }
-
-    function isStablecoin(address token) public view returns (bool) {
-        return stablecoins[token];
-    }
-
     function getRouters() external view returns (address[] memory) {
         return routers;
     }
@@ -286,74 +203,150 @@ contract MonBridgeDex {
         bestRoute.outputToken = outputToken;
         expectedOut = 0;
         
-        // Use iterative deepening with gas budgeting
-        uint gasCheckpoint = gasleft();
-        uint maxGasPerStrategy = gasCheckpoint / 20; // Reserve gas for execution
-        
-        // Phase 1: Quick direct routes with advanced splitting (15% gas budget)
-        if (gasleft() > maxGasPerStrategy) {
-            try this.findBestDirectRouteComplex(
+        // Try direct route first
+        try this.findBestSplitForHop(
+            amountIn,
+            inputToken,
+            outputToken,
+            new address[](0)
+        ) returns (uint directOutput, Split[] memory directSplits) {
+            if (directOutput > 0 && directSplits.length > 0) {
+                bestRoute.hops = 1;
+                bestRoute.splitRoutes = new Split[][](1);
+                bestRoute.splitRoutes[0] = directSplits;
+                expectedOut = directOutput;
+                
+                // If we find a good direct route, return it immediately to save gas
+                if (expectedOut > amountIn / 2) {
+                    return (bestRoute, expectedOut);
+                }
+            }
+        } catch {
+            // Continue if direct route fails
+        }
+
+        // Try two-hop route through WETH if neither token is WETH
+        if (inputToken != WETH && outputToken != WETH) {
+            try this.findBestRouterForPair(
                 amountIn,
                 inputToken,
-                outputToken
-            ) returns (uint directOutput, TradeRoute memory directRoute) {
-                if (directOutput > expectedOut) {
-                    bestRoute = directRoute;
-                    expectedOut = directOutput;
+                WETH
+            ) returns (address inToWethRouter, uint wethOutput) {
+                
+                if (wethOutput > 0 && inToWethRouter != address(0)) {
+                    try this.findBestRouterForPair(
+                        wethOutput,
+                        WETH,
+                        outputToken
+                    ) returns (address wethToOutRouter, uint finalOutput) {
+                        
+                        if (finalOutput > 0 && wethToOutRouter != address(0) && finalOutput > expectedOut) {
+                            TradeRoute memory wethRoute;
+                            wethRoute.inputToken = inputToken;
+                            wethRoute.outputToken = outputToken;
+                            wethRoute.hops = 2;
+                            wethRoute.splitRoutes = new Split[][](2);
+                            
+                            // First hop
+                            wethRoute.splitRoutes[0] = new Split[](1);
+                            wethRoute.splitRoutes[0][0] = Split({
+                                router: inToWethRouter,
+                                percentage: 10000, // 100%
+                                path: getPath(inputToken, WETH)
+                            });
+                            
+                            // Second hop
+                            wethRoute.splitRoutes[1] = new Split[](1);
+                            wethRoute.splitRoutes[1][0] = Split({
+                                router: wethToOutRouter,
+                                percentage: 10000, // 100%
+                                path: getPath(WETH, outputToken)
+                            });
+                            
+                            bestRoute = wethRoute;
+                            expectedOut = finalOutput;
+                        }
+                    } catch {
+                        // Continue if second hop of WETH route fails
+                    }
                 }
             } catch {
-                // Continue if direct route fails
+                // Continue if WETH route fails
             }
         }
         
-        // Phase 2: Smart multi-hop with preference-based pruning (40% gas budget)
-        if (gasleft() > maxGasPerStrategy * 2) {
-            try this.findBestMultiHopWithPreferences(
-                amountIn,
-                inputToken,
-                outputToken,
-                expectedOut // Pass current best as threshold
-            ) returns (uint multiHopOutput, TradeRoute memory multiHopRoute) {
-                if (multiHopOutput > expectedOut) {
-                    bestRoute = multiHopRoute;
-                    expectedOut = multiHopOutput;
+        // Try stablecoin routes with a more efficient approach
+        try this.getCommonStablecoins() returns (address[] memory stablecoins) {
+            for (uint i = 0; i < stablecoins.length && i < 2; i++) {  // Limit to first 2 stablecoins to save gas
+                address stablecoin = stablecoins[i];
+                if (stablecoin == address(0) || stablecoin == inputToken || stablecoin == outputToken || !isWhitelisted(stablecoin)) {
+                    continue;
                 }
-            } catch {
-                // Continue if multi-hop fails
+                
+                try this.findBestRouterForPair(
+                    amountIn,
+                    inputToken,
+                    stablecoin
+                ) returns (address bestRouterFirst, uint firstHopOutput) {
+                    if (firstHopOutput > 0 && bestRouterFirst != address(0)) {
+                        try this.findBestRouterForPair(
+                            firstHopOutput,
+                            stablecoin,
+                            outputToken
+                        ) returns (address bestRouterSecond, uint secondHopOutput) {
+                            if (secondHopOutput > expectedOut && bestRouterSecond != address(0)) {
+                                TradeRoute memory newRoute;
+                                newRoute.inputToken = inputToken;
+                                newRoute.outputToken = outputToken;
+                                newRoute.hops = 2;
+                                newRoute.splitRoutes = new Split[][](2);
+                                
+                                // First hop
+                                newRoute.splitRoutes[0] = new Split[](1);
+                                newRoute.splitRoutes[0][0] = Split({
+                                    router: bestRouterFirst,
+                                    percentage: 10000, // 100%
+                                    path: getPath(inputToken, stablecoin)
+                                });
+                                
+                                // Second hop
+                                newRoute.splitRoutes[1] = new Split[](1);
+                                newRoute.splitRoutes[1][0] = Split({
+                                    router: bestRouterSecond,
+                                    percentage: 10000, // 100%
+                                    path: getPath(stablecoin, outputToken)
+                                });
+
+                                bestRoute = newRoute;
+                                expectedOut = secondHopOutput;
+                            }
+                        } catch {
+                            // Continue if second hop fails
+                        }
+                    }
+                } catch {
+                    // Continue if first hop fails
+                }
             }
+        } catch {
+            // Continue if stablecoin routes fail
         }
         
-        // Phase 3: Complex arbitrage and cross-router strategies (25% gas budget)
-        if (gasleft() > maxGasPerStrategy) {
-            try this.findBestComplexStrategies(
+        // Only try two-hop route with custom method if we haven't found a good route yet
+        if (expectedOut == 0 || expectedOut < amountIn / 2) {
+            try this.findBestTwoHopRoute(
                 amountIn,
                 inputToken,
                 outputToken,
-                expectedOut
-            ) returns (uint complexOutput, TradeRoute memory complexRoute) {
-                if (complexOutput > expectedOut) {
-                    bestRoute = complexRoute;
-                    expectedOut = complexOutput;
+                new address[](0)
+            ) returns (uint twoHopOutput, TradeRoute memory twoHopRoute) {
+                
+                if (twoHopOutput > expectedOut && twoHopRoute.hops > 0) {
+                    bestRoute = twoHopRoute;
+                    expectedOut = twoHopOutput;
                 }
             } catch {
-                // Continue if complex strategies fail
-            }
-        }
-        
-        // Phase 4: Deep exhaustive search if we still have gas (remaining gas budget)
-        if (gasleft() > maxGasPerStrategy && expectedOut > 0) {
-            try this.findBestDeepSearch(
-                amountIn,
-                inputToken,
-                outputToken,
-                expectedOut
-            ) returns (uint deepOutput, TradeRoute memory deepRoute) {
-                if (deepOutput > expectedOut) {
-                    bestRoute = deepRoute;
-                    expectedOut = deepOutput;
-                }
-            } catch {
-                // Continue if deep search fails
+                // Continue if two-hop route fails
             }
         }
 
@@ -668,613 +661,6 @@ contract MonBridgeDex {
         }
         
         return result;
-    }
-    
-    // Get prioritized tokens based on preference: WETH > Stablecoins > Major > Whitelisted
-    function getPrioritizedIntermediateTokens(address inputToken, address outputToken) internal view returns (address[] memory) {
-        // Calculate total size needed
-        uint totalSize = 1; // WETH
-        if (inputToken != WETH && outputToken != WETH) totalSize++;
-        totalSize += stablecoinsList.length;
-        totalSize += majorTokensList.length;
-        totalSize += 20; // Limit other whitelisted to prevent gas issues
-        
-        address[] memory prioritized = new address[](totalSize);
-        uint idx = 0;
-        
-        // Priority 1: WETH (if not input/output)
-        if (inputToken != WETH && outputToken != WETH) {
-            prioritized[idx++] = WETH;
-        }
-        
-        // Priority 2: Stablecoins
-        for (uint i = 0; i < stablecoinsList.length; i++) {
-            if (stablecoinsList[i] != inputToken && stablecoinsList[i] != outputToken && stablecoinsList[i] != address(0)) {
-                prioritized[idx++] = stablecoinsList[i];
-            }
-        }
-        
-        // Priority 3: Major tokens
-        for (uint i = 0; i < majorTokensList.length; i++) {
-            if (majorTokensList[i] != inputToken && majorTokensList[i] != outputToken && majorTokensList[i] != address(0)) {
-                // Check if already added
-                bool exists = false;
-                for (uint j = 0; j < idx; j++) {
-                    if (prioritized[j] == majorTokensList[i]) {
-                        exists = true;
-                        break;
-                    }
-                }
-                if (!exists) {
-                    prioritized[idx++] = majorTokensList[i];
-                }
-            }
-        }
-        
-        // Priority 4: Add input/output tokens for complex routes
-        prioritized[idx++] = inputToken;
-        prioritized[idx++] = outputToken;
-        
-        // Resize to actual count
-        address[] memory result = new address[](idx);
-        for (uint i = 0; i < idx; i++) {
-            result[i] = prioritized[i];
-        }
-        
-        return result;
-    }
-    
-    // Phase 1: Advanced direct route finding
-    function findBestDirectRouteComplex(
-        uint amountIn,
-        address inputToken,
-        address outputToken
-    ) external view returns (uint expectedOut, TradeRoute memory route) {
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = 1;
-        bestRoute.splitRoutes = new Split[][](1);
-        uint bestOutput = 0;
-        
-        // Try advanced splitting with multiple paths per router
-        (uint splitOutput, Split[] memory bestSplits) = findBestSplitForHopAdvanced(
-            amountIn,
-            inputToken,
-            outputToken,
-            new address[](0)
-        );
-        
-        if (splitOutput > bestOutput) {
-            bestOutput = splitOutput;
-            bestRoute.splitRoutes[0] = bestSplits;
-        }
-        
-        // Try single intermediate with each prioritized token
-        address[] memory intermediates = getPrioritizedIntermediateTokens(inputToken, outputToken);
-        
-        for (uint i = 0; i < intermediates.length && i < 8 && gasleft() > 50000; i++) {
-            address intermediate = intermediates[i];
-            if (intermediate == address(0) || intermediate == inputToken || intermediate == outputToken) continue;
-            
-            // Try complex 2-hop with advanced splitting on both hops
-            (uint complexOutput, TradeRoute memory complexRoute) = findBestTwoHopComplexRoute(
-                amountIn,
-                inputToken,
-                intermediate,
-                outputToken
-            );
-            
-            if (complexOutput > bestOutput) {
-                bestOutput = complexOutput;
-                bestRoute = complexRoute;
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Enhanced 2-hop route with complex splitting on both hops
-    function findBestTwoHopComplexRoute(
-        uint amountIn,
-        address inputToken,
-        address intermediate,
-        address outputToken
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = 2;
-        bestRoute.splitRoutes = new Split[][](2);
-        uint bestOutput = 0;
-        
-        // First hop: Find best splits from input to intermediate
-        (uint firstHopOutput, Split[] memory firstHopSplits) = findBestSplitForHopAdvanced(
-            amountIn,
-            inputToken,
-            intermediate,
-            new address[](0)
-        );
-        
-        if (firstHopOutput == 0 || firstHopSplits.length == 0) return (0, bestRoute);
-        
-        // Second hop: Find best splits from intermediate to output
-        (uint secondHopOutput, Split[] memory secondHopSplits) = findBestSplitForHopAdvanced(
-            firstHopOutput,
-            intermediate,
-            outputToken,
-            new address[](0)
-        );
-        
-        if (secondHopOutput > 0 && secondHopSplits.length > 0) {
-            bestRoute.splitRoutes[0] = firstHopSplits;
-            bestRoute.splitRoutes[1] = secondHopSplits;
-            bestOutput = secondHopOutput;
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Phase 2: Multi-hop with intelligent preferences
-    function findBestMultiHopWithPreferences(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint currentBest
-    ) external view returns (uint expectedOut, TradeRoute memory route) {
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        uint bestOutput = currentBest;
-        
-        address[] memory prioritizedTokens = getPrioritizedIntermediateTokens(inputToken, outputToken);
-        
-        // Try 3-hop routes with preference-based selection
-        for (uint hops = 3; hops <= MAX_HOPS && gasleft() > 100000; hops++) {
-            bestRoute.hops = hops;
-            bestRoute.splitRoutes = new Split[][](hops);
-            
-            // Use beam search with limited width to manage gas
-            uint beamWidth = gasleft() > 200000 ? 5 : 3;
-            
-            (uint hopOutput, TradeRoute memory hopRoute) = findBestMultiHopBeamSearch(
-                amountIn,
-                inputToken,
-                outputToken,
-                hops,
-                prioritizedTokens,
-                beamWidth,
-                bestOutput
-            );
-            
-            if (hopOutput > bestOutput) {
-                bestOutput = hopOutput;
-                bestRoute = hopRoute;
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Beam search for multi-hop routes
-    function findBestMultiHopBeamSearch(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint hops,
-        address[] memory prioritizedTokens,
-        uint beamWidth,
-        uint threshold
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        if (hops < 2) return (0, route);
-        
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = hops;
-        bestRoute.splitRoutes = new Split[][](hops);
-        uint bestOutput = 0;
-        
-        // Limit intermediate token exploration based on gas
-        uint maxIntermediates = gasleft() > 150000 ? 12 : 8;
-        
-        for (uint i = 0; i < prioritizedTokens.length && i < maxIntermediates && gasleft() > 60000; i++) {
-            address firstIntermediate = prioritizedTokens[i];
-            if (firstIntermediate == address(0) || firstIntermediate == inputToken || firstIntermediate == outputToken) continue;
-            
-            // First hop with advanced splitting
-            (uint firstOutput, Split[] memory firstSplits) = findBestSplitForHopAdvanced(
-                amountIn,
-                inputToken,
-                firstIntermediate,
-                new address[](0)
-            );
-            
-            if (firstOutput == 0 || firstSplits.length == 0) continue;
-            
-            if (hops == 2) {
-                // Direct to output
-                (uint finalOutput, Split[] memory finalSplits) = findBestSplitForHopAdvanced(
-                    firstOutput,
-                    firstIntermediate,
-                    outputToken,
-                    new address[](0)
-                );
-                
-                if (finalOutput > bestOutput && finalOutput > threshold) {
-                    bestOutput = finalOutput;
-                    bestRoute.splitRoutes[0] = firstSplits;
-                    bestRoute.splitRoutes[1] = finalSplits;
-                }
-            } else {
-                // Continue with remaining hops
-                address[] memory remainingPath = new address[](1);
-                remainingPath[0] = firstIntermediate;
-                
-                (uint remainingOutput, TradeRoute memory remainingRoute) = findBestMultiHopBeamSearch(
-                    firstOutput,
-                    firstIntermediate,
-                    outputToken,
-                    hops - 1,
-                    prioritizedTokens,
-                    beamWidth - 1,
-                    threshold
-                );
-                
-                if (remainingOutput > bestOutput && remainingOutput > threshold) {
-                    bestOutput = remainingOutput;
-                    bestRoute.splitRoutes[0] = firstSplits;
-                    for (uint j = 0; j < hops - 1 && j < remainingRoute.splitRoutes.length; j++) {
-                        bestRoute.splitRoutes[j + 1] = remainingRoute.splitRoutes[j];
-                    }
-                }
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Phase 3: Complex strategies
-    function findBestComplexStrategies(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint currentBest
-    ) external view returns (uint expectedOut, TradeRoute memory route) {
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        uint bestOutput = currentBest;
-        
-        // Strategy 1: Arbitrage through high-liquidity pairs
-        if (gasleft() > 80000) {
-            (uint arbOutput, TradeRoute memory arbRoute) = findBestArbitrageRouteAdvanced(
-                amountIn,
-                inputToken,
-                outputToken,
-                currentBest
-            );
-            
-            if (arbOutput > bestOutput) {
-                bestOutput = arbOutput;
-                bestRoute = arbRoute;
-            }
-        }
-        
-        // Strategy 2: Cross-router optimization
-        if (gasleft() > 60000) {
-            (uint crossOutput, TradeRoute memory crossRoute) = findBestCrossRouterRouteAdvanced(
-                amountIn,
-                inputToken,
-                outputToken,
-                currentBest
-            );
-            
-            if (crossOutput > bestOutput) {
-                bestOutput = crossOutput;
-                bestRoute = crossRoute;
-            }
-        }
-        
-        // Strategy 3: Multi-path splitting across different strategies
-        if (gasleft() > 40000) {
-            (uint multiOutput, TradeRoute memory multiRoute) = findBestMultiPathStrategy(
-                amountIn,
-                inputToken,
-                outputToken,
-                currentBest
-            );
-            
-            if (multiOutput > bestOutput) {
-                bestOutput = multiOutput;
-                bestRoute = multiRoute;
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Advanced arbitrage with preference-based selection
-    function findBestArbitrageRouteAdvanced(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint threshold
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = 3;
-        bestRoute.splitRoutes = new Split[][](3);
-        uint bestOutput = 0;
-        
-        address[] memory prioritizedTokens = getPrioritizedIntermediateTokens(inputToken, outputToken);
-        
-        // Try triangular arbitrage with prioritized intermediates
-        for (uint i = 0; i < prioritizedTokens.length && i < 6 && gasleft() > 30000; i++) {
-            address intermediate = prioritizedTokens[i];
-            if (intermediate == address(0) || intermediate == inputToken || intermediate == outputToken) continue;
-            
-            // Route: Input -> Intermediate -> Input -> Output
-            (uint intermediateAmount, Split[] memory firstSplits) = findBestSplitForHopAdvanced(
-                amountIn,
-                inputToken,
-                intermediate,
-                new address[](0)
-            );
-            
-            if (intermediateAmount == 0) continue;
-            
-            (uint backToInputAmount, Split[] memory secondSplits) = findBestSplitForHopAdvanced(
-                intermediateAmount,
-                intermediate,
-                inputToken,
-                new address[](0)
-            );
-            
-            if (backToInputAmount == 0) continue;
-            
-            (uint finalAmount, Split[] memory thirdSplits) = findBestSplitForHopAdvanced(
-                backToInputAmount,
-                inputToken,
-                outputToken,
-                new address[](0)
-            );
-            
-            if (finalAmount > bestOutput && finalAmount > threshold) {
-                bestOutput = finalAmount;
-                bestRoute.splitRoutes[0] = firstSplits;
-                bestRoute.splitRoutes[1] = secondSplits;
-                bestRoute.splitRoutes[2] = thirdSplits;
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Advanced cross-router optimization
-    function findBestCrossRouterRouteAdvanced(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint threshold
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = 2;
-        bestRoute.splitRoutes = new Split[][](2);
-        uint bestOutput = 0;
-        
-        address[] memory prioritizedTokens = getPrioritizedIntermediateTokens(inputToken, outputToken);
-        
-        // Try cross-router strategies with prioritized intermediates
-        for (uint i = 0; i < prioritizedTokens.length && i < 8 && gasleft() > 25000; i++) {
-            address intermediate = prioritizedTokens[i];
-            if (intermediate == address(0) || intermediate == inputToken || intermediate == outputToken) continue;
-            
-            // Try all router combinations
-            for (uint r1 = 0; r1 < routers.length && gasleft() > 15000; r1++) {
-                if (routers[r1] == address(0)) continue;
-                
-                address[] memory firstPath = getPath(inputToken, intermediate);
-                uint firstOutput = 0;
-                
-                try IUniswapV2Router02(routers[r1]).getAmountsOut(amountIn, firstPath) returns (uint[] memory res) {
-                    if (res.length > 1) firstOutput = res[res.length - 1];
-                } catch { continue; }
-                
-                if (firstOutput == 0) continue;
-                
-                // Find best router for second hop
-                (uint secondOutput, Split[] memory secondSplits) = findBestSplitForHopAdvanced(
-                    firstOutput,
-                    intermediate,
-                    outputToken,
-                    new address[](0)
-                );
-                
-                if (secondOutput > bestOutput && secondOutput > threshold) {
-                    bestOutput = secondOutput;
-                    
-                    bestRoute.splitRoutes[0] = new Split[](1);
-                    bestRoute.splitRoutes[0][0] = Split({
-                        router: routers[r1],
-                        percentage: 10000,
-                        path: firstPath
-                    });
-                    
-                    bestRoute.splitRoutes[1] = secondSplits;
-                }
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Multi-path strategy combining different approaches
-    function findBestMultiPathStrategy(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint threshold
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        // This function would implement complex multi-path strategies
-        // For now, return the threshold to indicate no improvement
-        return (threshold, route);
-    }
-    
-    // Phase 4: Deep exhaustive search with intelligent pruning
-    function findBestDeepSearch(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint currentBest
-    ) external view returns (uint expectedOut, TradeRoute memory route) {
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        uint bestOutput = currentBest;
-        
-        if (gasleft() < 50000) return (bestOutput, bestRoute);
-        
-        address[] memory prioritizedTokens = getPrioritizedIntermediateTokens(inputToken, outputToken);
-        
-        // Deep search with MAX_HOPS but intelligent pruning
-        for (uint hops = 2; hops <= MAX_HOPS && gasleft() > 30000; hops++) {
-            bestRoute.hops = hops;
-            bestRoute.splitRoutes = new Split[][](hops);
-            
-            (uint deepOutput, TradeRoute memory deepRoute) = deepSearchWithPruning(
-                amountIn,
-                inputToken,
-                outputToken,
-                hops,
-                prioritizedTokens,
-                bestOutput
-            );
-            
-            if (deepOutput > bestOutput) {
-                bestOutput = deepOutput;
-                bestRoute = deepRoute;
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Deep search with aggressive pruning to manage gas
-    function deepSearchWithPruning(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint hops,
-        address[] memory prioritizedTokens,
-        uint threshold
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        if (hops < 2 || gasleft() < 20000) return (0, route);
-        
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = hops;
-        bestRoute.splitRoutes = new Split[][](hops);
-        uint bestOutput = 0;
-        
-        // Limit exploration based on remaining gas
-        uint maxExploration = gasleft() > 40000 ? 6 : 3;
-        
-        for (uint i = 0; i < prioritizedTokens.length && i < maxExploration && gasleft() > 10000; i++) {
-            address firstIntermediate = prioritizedTokens[i];
-            if (firstIntermediate == address(0) || firstIntermediate == inputToken || firstIntermediate == outputToken) continue;
-            
-            // Quick profitability check before deep exploration
-            uint estimatedOutput = quickEstimateOutput(amountIn, inputToken, firstIntermediate, outputToken, hops);
-            if (estimatedOutput <= threshold) continue; // Prune unprofitable paths early
-            
-            (uint firstOutput, Split[] memory firstSplits) = findBestSplitForHopAdvanced(
-                amountIn,
-                inputToken,
-                firstIntermediate,
-                new address[](0)
-            );
-            
-            if (firstOutput == 0) continue;
-            
-            if (hops == 2) {
-                (uint finalOutput, Split[] memory finalSplits) = findBestSplitForHopAdvanced(
-                    firstOutput,
-                    firstIntermediate,
-                    outputToken,
-                    new address[](0)
-                );
-                
-                if (finalOutput > bestOutput && finalOutput > threshold) {
-                    bestOutput = finalOutput;
-                    bestRoute.splitRoutes[0] = firstSplits;
-                    bestRoute.splitRoutes[1] = finalSplits;
-                }
-            } else {
-                (uint remainingOutput, TradeRoute memory remainingRoute) = deepSearchWithPruning(
-                    firstOutput,
-                    firstIntermediate,
-                    outputToken,
-                    hops - 1,
-                    prioritizedTokens,
-                    threshold
-                );
-                
-                if (remainingOutput > bestOutput && remainingOutput > threshold) {
-                    bestOutput = remainingOutput;
-                    bestRoute.splitRoutes[0] = firstSplits;
-                    for (uint j = 0; j < hops - 1 && j < remainingRoute.splitRoutes.length; j++) {
-                        bestRoute.splitRoutes[j + 1] = remainingRoute.splitRoutes[j];
-                    }
-                }
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-    
-    // Quick estimate for path profitability to enable early pruning
-    function quickEstimateOutput(
-        uint amountIn,
-        address inputToken,
-        address intermediate,
-        address outputToken,
-        uint hops
-    ) internal view returns (uint estimatedOutput) {
-        // Simple estimation using best single router for each hop
-        address bestRouter = routers[0];
-        for (uint i = 0; i < routers.length; i++) {
-            if (routers[i] != address(0)) {
-                bestRouter = routers[i];
-                break;
-            }
-        }
-        
-        if (bestRouter == address(0)) return 0;
-        
-        if (hops == 2) {
-            address[] memory path1 = getPath(inputToken, intermediate);
-            address[] memory path2 = getPath(intermediate, outputToken);
-            
-            try IUniswapV2Router02(bestRouter).getAmountsOut(amountIn, path1) returns (uint[] memory res1) {
-                if (res1.length > 1) {
-                    try IUniswapV2Router02(bestRouter).getAmountsOut(res1[res1.length - 1], path2) returns (uint[] memory res2) {
-                        if (res2.length > 1) {
-                            estimatedOutput = res2[res2.length - 1];
-                        }
-                    } catch { estimatedOutput = 0; }
-                }
-            } catch { estimatedOutput = 0; }
-        } else {
-            // For 3+ hops, use conservative estimate
-            estimatedOutput = amountIn / (hops + 1); // Very conservative estimate
-        }
-        
-        return estimatedOutput;
     }
     
     // Helper function to analyze liquidity depth for a token pair
@@ -1689,849 +1075,25 @@ contract MonBridgeDex {
 
 
     function getCommonIntermediates() internal view returns (address[] memory) {
-        // Calculate total size needed
-        uint totalSize = 1 + majorTokensList.length + stablecoinsList.length; // +1 for WETH
-        address[] memory intermediates = new address[](totalSize);
-        
-        uint index = 0;
-        
-        // Always include WETH as primary intermediate
-        intermediates[index++] = WETH;
-        
-        // Add all major tokens
-        for (uint i = 0; i < majorTokensList.length; i++) {
-            intermediates[index++] = majorTokensList[i];
-        }
-        
-        // Add all stablecoins
-        for (uint i = 0; i < stablecoinsList.length; i++) {
-            intermediates[index++] = stablecoinsList[i];
-        }
-        
+        // Common intermediates include WETH and top tokens on the network
+        // The exact list will depend on the blockchain the contract is deployed to
+        address[] memory intermediates = new address[](5);
+        intermediates[0] = WETH;
+        intermediates[1] = address(0xE0590015A873bF326bd645c3E1266d4db41C4E6B); // Major token 1
+        intermediates[2] = address(0x0F0BDEbF0F83cD1EE3974779Bcb7315f9808c714); // Major token 2
+        intermediates[3] = address(0x88b8E2161DEDC77EF4ab7585569D2415a1C1055D); // Stablecoin 1
+        intermediates[4] = address(0xf817257fed379853cDe0fa4F97AB987181B1E5Ea); // Stablecoin 2
         return intermediates;
     }
 
-    function getCommonStablecoins() public view returns (address[] memory) {
-        return stablecoinsList;
-    }
-
-    // Calculate price impact threshold based on amount and tokens
-    function calculatePriceImpactThreshold(uint amountIn, address inputToken, address outputToken) internal view returns (uint threshold) {
-        // Base threshold of 3%
-        threshold = 300;
-        
-        // Adjust based on amount size
-        if (amountIn > 10**21) { // Large trades
-            threshold = 500; // 5%
-        } else if (amountIn < 10**18) { // Small trades
-            threshold = 150; // 1.5%
-        }
-        
-        // Adjust based on token types
-        if ((inputToken == WETH || outputToken == WETH) || 
-            (isWhitelisted(inputToken) && isWhitelisted(outputToken))) {
-            threshold = threshold * 7 / 10; // Reduce threshold for stable pairs
-        }
-        
-        return threshold;
-    }
-
-    // Calculate price impact for a route with splits
-    function calculateRoutesPriceImpact(uint amountIn, Split[] memory splits) internal view returns (uint totalImpact) {
-        totalImpact = 0;
-        uint totalWeight = 0;
-        
-        for (uint i = 0; i < splits.length; i++) {
-            if (splits[i].router == address(0) || splits[i].percentage == 0) continue;
-            
-            uint splitAmount = (amountIn * splits[i].percentage) / 10000;
-            if (splitAmount == 0) continue;
-            
-            // Calculate impact for this split
-            uint impact = calculateSingleSplitPriceImpact(splitAmount, splits[i]);
-            totalImpact += impact * splits[i].percentage;
-            totalWeight += splits[i].percentage;
-        }
-        
-        if (totalWeight > 0) {
-            totalImpact = totalImpact / totalWeight;
-        }
-        
-        return totalImpact;
-    }
-
-    // Calculate price impact for a single split
-    function calculateSingleSplitPriceImpact(uint amountIn, Split memory split) internal view returns (uint impact) {
-        if (split.path.length < 2) return 10000; // 100% impact for invalid paths
-        
-        // Test with small amount to estimate rate
-        uint smallAmount = amountIn / 20; // 5% of amount
-        if (smallAmount == 0) smallAmount = 1;
-        
-        uint smallOutput = 0;
-        uint largeOutput = 0;
-        
-        try IUniswapV2Router02(split.router).getAmountsOut(smallAmount, split.path) returns (uint[] memory smallRes) {
-            if (smallRes.length > 1) smallOutput = smallRes[smallRes.length - 1];
-        } catch {
-            return 10000; // 100% impact for failed routes
-        }
-        
-        try IUniswapV2Router02(split.router).getAmountsOut(amountIn, split.path) returns (uint[] memory largeRes) {
-            if (largeRes.length > 1) largeOutput = largeRes[largeRes.length - 1];
-        } catch {
-            return 10000; // 100% impact for failed routes
-        }
-        
-        if (smallOutput == 0 || largeOutput == 0) return 10000;
-        
-        // Calculate expected large output based on small output rate
-        uint expectedLargeOutput = (smallOutput * amountIn) / smallAmount;
-        
-        if (expectedLargeOutput > largeOutput) {
-            impact = ((expectedLargeOutput - largeOutput) * 10000) / expectedLargeOutput;
-        } else {
-            impact = 0;
-        }
-        
-        return impact;
-    }
-
-    // Enhanced split finding with advanced multi-path analysis
-    function findBestSplitForHopAdvanced(
-        uint amountIn,
-        address tokenIn,
-        address tokenOut,
-        address[] memory forbiddenTokens
-    ) public view returns (uint expectedOut, Split[] memory splits) {
-        // Input validation
-        if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut || amountIn == 0) {
-            return (0, new Split[](0));
-        }
-        
-        // Get all possible paths for this hop
-        address[][] memory allPaths = findAllPossiblePaths(tokenIn, tokenOut, 1);
-        
-        // Evaluate each router with each path
-        uint bestOutput = 0;
-        Split[] memory bestSplits;
-        
-        // Try single router solutions first
-        for (uint r = 0; r < routers.length; r++) {
-            if (routers[r] == address(0)) continue;
-            
-            for (uint p = 0; p < allPaths.length; p++) {
-                if (allPaths[p].length == 0) continue;
-                
-                uint output = 0;
-                try IUniswapV2Router02(routers[r]).getAmountsOut(amountIn, allPaths[p]) returns (uint[] memory res) {
-                    if (res.length > 1) output = res[res.length - 1];
-                } catch {
-                    continue;
-                }
-                
-                if (output > bestOutput) {
-                    bestOutput = output;
-                    bestSplits = new Split[](1);
-                    bestSplits[0] = Split({
-                        router: routers[r],
-                        percentage: 10000,
-                        path: allPaths[p]
-                    });
-                }
-            }
-        }
-        
-        // Try multi-router splits with advanced optimization
-        if (routers.length >= 2) {
-            (uint multiRouterOutput, Split[] memory multiRouterSplits) = optimizeMultiRouterSplits(
-                amountIn, tokenIn, tokenOut, allPaths
-            );
-            
-            if (multiRouterOutput > bestOutput) {
-                bestOutput = multiRouterOutput;
-                bestSplits = multiRouterSplits;
-            }
-        }
-        
-        return (bestOutput, bestSplits);
-    }
-
-    // Find all possible paths between two tokens
-    function findAllPossiblePaths(address tokenIn, address tokenOut, uint maxIntermediates) internal view returns (address[][] memory) {
-        address[][] memory paths = new address[][](20); // Max 20 paths to limit gas
-        uint pathCount = 0;
-        
-        // Direct path
-        paths[pathCount] = new address[](2);
-        paths[pathCount][0] = tokenIn;
-        paths[pathCount][1] = tokenOut;
-        pathCount++;
-        
-        if (maxIntermediates > 0 && pathCount < 20) {
-            address[] memory intermediates = getAllWhitelistedTokens();
-            
-            // Single intermediate paths
-            for (uint i = 0; i < intermediates.length && pathCount < 20; i++) {
-                address intermediate = intermediates[i];
-                if (intermediate == address(0) || intermediate == tokenIn || intermediate == tokenOut) continue;
-                
-                paths[pathCount] = new address[](3);
-                paths[pathCount][0] = tokenIn;
-                paths[pathCount][1] = intermediate;
-                paths[pathCount][2] = tokenOut;
-                pathCount++;
-            }
-        }
-        
-        // Resize array to actual count
-        address[][] memory result = new address[][](pathCount);
-        for (uint i = 0; i < pathCount; i++) {
-            result[i] = paths[i];
-        }
-        
-        return result;
-    }
-
-    // Optimize multi-router splits with advanced algorithms
-    function optimizeMultiRouterSplits(
-        uint amountIn,
-        address tokenIn,
-        address tokenOut,
-        address[][] memory paths
-    ) internal view returns (uint bestOutput, Split[] memory bestSplits) {
-        bestOutput = 0;
-        
-        // Get top performing router-path combinations
-        uint maxCombinations = routers.length * paths.length;
-        if (maxCombinations > 20) maxCombinations = 20; // Limit to prevent gas issues
-        
-        address[] memory routersList = new address[](maxCombinations);
-        address[][] memory pathsList = new address[][](maxCombinations);
-        uint[] memory outputsList = new uint[](maxCombinations);
-        uint combinationCount = 0;
-        
-        // Evaluate all router-path combinations
-        for (uint r = 0; r < routers.length && combinationCount < maxCombinations; r++) {
-            if (routers[r] == address(0)) continue;
-            
-            for (uint p = 0; p < paths.length && combinationCount < maxCombinations; p++) {
-                if (paths[p].length == 0) continue;
-                
-                uint output = 0;
-                try IUniswapV2Router02(routers[r]).getAmountsOut(amountIn, paths[p]) returns (uint[] memory res) {
-                    if (res.length > 1) output = res[res.length - 1];
-                } catch {
-                    continue;
-                }
-                
-                if (output > 0) {
-                    routersList[combinationCount] = routers[r];
-                    pathsList[combinationCount] = paths[p];
-                    outputsList[combinationCount] = output;
-                    combinationCount++;
-                }
-            }
-        }
-        
-        if (combinationCount == 0) return (0, new Split[](0));
-        
-        // Sort combinations by output (simple bubble sort for small arrays)
-        for (uint i = 0; i < combinationCount; i++) {
-            for (uint j = i + 1; j < combinationCount; j++) {
-                if (outputsList[j] > outputsList[i]) {
-                    // Swap outputs
-                    uint tempOutput = outputsList[i];
-                    outputsList[i] = outputsList[j];
-                    outputsList[j] = tempOutput;
-                    
-                    // Swap routers
-                    address tempRouter = routersList[i];
-                    routersList[i] = routersList[j];
-                    routersList[j] = tempRouter;
-                    
-                    // Swap paths
-                    address[] memory tempPath = pathsList[i];
-                    pathsList[i] = pathsList[j];
-                    pathsList[j] = tempPath;
-                }
-            }
-        }
-        
-        // Try different split combinations
-        uint maxSplits = combinationCount > MAX_SPLITS_PER_HOP ? MAX_SPLITS_PER_HOP : combinationCount;
-        
-        for (uint splitCount = 1; splitCount <= maxSplits; splitCount++) {
-            (uint output, uint[] memory percentages) = optimizeSplitPercentagesAdvanced(
-                amountIn, tokenIn, tokenOut, routersList, pathsList, splitCount
-            );
-            
-            if (output > bestOutput) {
-                bestOutput = output;
-                
-                // Create splits array
-                uint validSplits = 0;
-                for (uint i = 0; i < splitCount; i++) {
-                    if (percentages[i] > 0) validSplits++;
-                }
-                
-                bestSplits = new Split[](validSplits);
-                uint splitIndex = 0;
-                
-                for (uint i = 0; i < splitCount; i++) {
-                    if (percentages[i] > 0) {
-                        bestSplits[splitIndex] = Split({
-                            router: routersList[i],
-                            percentage: percentages[i],
-                            path: pathsList[i]
-                        });
-                        splitIndex++;
-                    }
-                }
-            }
-        }
-        
-        return (bestOutput, bestSplits);
-    }
-
-    // Advanced split percentage optimization
-    function optimizeSplitPercentagesAdvanced(
-        uint amountIn,
-        address tokenIn,
-        address tokenOut,
-        address[] memory routersList,
-        address[][] memory pathsList,
-        uint splitCount
-    ) internal view returns (uint bestOutput, uint[] memory bestPercentages) {
-        bestOutput = 0;
-        bestPercentages = new uint[](splitCount);
-        
-        // Calculate price impacts for each router-path combination
-        uint[] memory priceImpacts = new uint[](splitCount);
-        uint[] memory baseOutputs = new uint[](splitCount);
-        
-        for (uint i = 0; i < splitCount; i++) {
-            if (routersList[i] == address(0) || pathsList[i].length == 0) continue;
-            
-            // Calculate price impact
-            uint smallAmount = amountIn / 20; // 5% test
-            if (smallAmount == 0) smallAmount = 1;
-            
-            uint smallOut = 0;
-            uint largeOut = 0;
-            
-            try IUniswapV2Router02(routersList[i]).getAmountsOut(smallAmount, pathsList[i]) returns (uint[] memory res) {
-                if (res.length > 1) smallOut = res[res.length - 1];
-            } catch {
-                priceImpacts[i] = 10000; // 100% impact
-                continue;
-            }
-            
-            try IUniswapV2Router02(routersList[i]).getAmountsOut(amountIn, pathsList[i]) returns (uint[] memory res) {
-                if (res.length > 1) {
-                    largeOut = res[res.length - 1];
-                    baseOutputs[i] = largeOut;
-                }
-            } catch {
-                priceImpacts[i] = 10000; // 100% impact
-                continue;
-            }
-            
-            if (smallOut > 0 && largeOut > 0) {
-                uint expectedLarge = (smallOut * amountIn) / smallAmount;
-                if (expectedLarge > largeOut) {
-                    priceImpacts[i] = ((expectedLarge - largeOut) * 10000) / expectedLarge;
-                } else {
-                    priceImpacts[i] = 0;
-                }
-            } else {
-                priceImpacts[i] = 10000;
-            }
-        }
-        
-        // Generate optimal distribution based on price impacts and outputs
-        uint totalInvertedImpact = 0;
-        uint[] memory invertedImpacts = new uint[](splitCount);
-        
-        for (uint i = 0; i < splitCount; i++) {
-            if (baseOutputs[i] > 0) {
-                uint impact = priceImpacts[i] > 5000 ? 5000 : priceImpacts[i]; // Cap at 50%
-                invertedImpacts[i] = 5000 - impact;
-                totalInvertedImpact += invertedImpacts[i];
-            }
-        }
-        
-        if (totalInvertedImpact > 0) {
-            // Distribute based on inverted price impact
-            for (uint i = 0; i < splitCount; i++) {
-                if (baseOutputs[i] > 0) {
-                    bestPercentages[i] = (invertedImpacts[i] * 10000) / totalInvertedImpact;
-                }
-            }
-            
-            // Calculate output with these percentages
-            bestOutput = calculateSplitOutputAdvanced(amountIn, routersList, pathsList, bestPercentages, splitCount);
-        }
-        
-        // Try additional distribution strategies
-        uint[][] memory testDistributions = generateAdvancedTestDistributions(splitCount, baseOutputs, priceImpacts);
-        
-        for (uint d = 0; d < testDistributions.length; d++) {
-            uint output = calculateSplitOutputAdvanced(amountIn, routersList, pathsList, testDistributions[d], splitCount);
-            if (output > bestOutput) {
-                bestOutput = output;
-                bestPercentages = testDistributions[d];
-            }
-        }
-        
-        return (bestOutput, bestPercentages);
-    }
-
-    // Calculate split output for advanced routing
-    function calculateSplitOutputAdvanced(
-        uint amountIn,
-        address[] memory routersList,
-        address[][] memory pathsList,
-        uint[] memory percentages,
-        uint splitCount
-    ) internal view returns (uint totalOutput) {
-        totalOutput = 0;
-        
-        for (uint i = 0; i < splitCount; i++) {
-            if (routersList[i] == address(0) || pathsList[i].length == 0 || percentages[i] == 0) continue;
-            
-            uint splitAmount = (amountIn * percentages[i]) / 10000;
-            if (splitAmount == 0) continue;
-            
-            try IUniswapV2Router02(routersList[i]).getAmountsOut(splitAmount, pathsList[i]) returns (uint[] memory res) {
-                if (res.length > 1) {
-                    totalOutput += res[res.length - 1];
-                }
-            } catch {
-                // Skip failed routes
-            }
-        }
-        
-        return totalOutput;
-    }
-
-    // Generate advanced test distributions
-    function generateAdvancedTestDistributions(
-        uint splitCount,
-        uint[] memory baseOutputs,
-        uint[] memory priceImpacts
-    ) internal pure returns (uint[][] memory) {
-        uint[][] memory distributions = new uint[][](15); // More focused distributions
-        
-        // 100% to best route
-        distributions[0] = new uint[](splitCount);
-        uint bestIndex = 0;
-        uint bestOutput = 0;
-        for (uint i = 0; i < splitCount; i++) {
-            if (baseOutputs[i] > bestOutput) {
-                bestOutput = baseOutputs[i];
-                bestIndex = i;
-            }
-        }
-        distributions[0][bestIndex] = 10000;
-        
-        if (splitCount >= 2) {
-            // Find second best
-            uint secondBestIndex = 0;
-            uint secondBestOutput = 0;
-            for (uint i = 0; i < splitCount; i++) {
-                if (i != bestIndex && baseOutputs[i] > secondBestOutput) {
-                    secondBestOutput = baseOutputs[i];
-                    secondBestIndex = i;
-                }
-            }
-            
-            // Various two-way splits
-            uint[] memory ratios = new uint[](8);
-            ratios[0] = 9000; ratios[1] = 8000; ratios[2] = 7000; ratios[3] = 6000;
-            ratios[4] = 5500; ratios[5] = 5000; ratios[6] = 4000; ratios[7] = 3000;
-            
-            for (uint r = 0; r < 8; r++) {
-                distributions[r + 1] = new uint[](splitCount);
-                distributions[r + 1][bestIndex] = ratios[r];
-                distributions[r + 1][secondBestIndex] = 10000 - ratios[r];
-            }
-            
-            // Equal distribution among top performers
-            distributions[9] = new uint[](splitCount);
-            uint validRoutes = 0;
-            for (uint i = 0; i < splitCount; i++) {
-                if (baseOutputs[i] > 0) validRoutes++;
-            }
-            
-            if (validRoutes > 0) {
-                uint equalShare = 10000 / validRoutes;
-                for (uint i = 0; i < splitCount; i++) {
-                    if (baseOutputs[i] > 0) {
-                        distributions[9][i] = equalShare;
-                    }
-                }
-            }
-            
-            // Impact-based distribution (favor low impact routes)
-            distributions[10] = new uint[](splitCount);
-            uint totalWeight = 0;
-            for (uint i = 0; i < splitCount; i++) {
-                if (baseOutputs[i] > 0) {
-                    uint weight = priceImpacts[i] < 1000 ? 1000 - priceImpacts[i] : 1;
-                    distributions[10][i] = weight;
-                    totalWeight += weight;
-                }
-            }
-            
-            if (totalWeight > 0) {
-                for (uint i = 0; i < splitCount; i++) {
-                    if (distributions[10][i] > 0) {
-                        distributions[10][i] = (distributions[10][i] * 10000) / totalWeight;
-                    }
-                }
-            }
-            
-            // Output-weighted distribution
-            distributions[11] = new uint[](splitCount);
-            uint totalOutputWeight = 0;
-            for (uint i = 0; i < splitCount; i++) {
-                totalOutputWeight += baseOutputs[i];
-            }
-            
-            if (totalOutputWeight > 0) {
-                for (uint i = 0; i < splitCount; i++) {
-                    distributions[11][i] = (baseOutputs[i] * 10000) / totalOutputWeight;
-                }
-            }
-            
-            // Hybrid distribution (output + low impact)
-            distributions[12] = new uint[](splitCount);
-            for (uint i = 0; i < splitCount; i++) {
-                if (baseOutputs[i] > 0) {
-                    uint outputWeight = baseOutputs[i];
-                    uint impactWeight = priceImpacts[i] < 2000 ? 2000 - priceImpacts[i] : 1;
-                    distributions[12][i] = sqrt(outputWeight * impactWeight);
-                }
-            }
-            
-            uint hybridTotal = 0;
-            for (uint i = 0; i < splitCount; i++) {
-                hybridTotal += distributions[12][i];
-            }
-            
-            if (hybridTotal > 0) {
-                for (uint i = 0; i < splitCount; i++) {
-                    distributions[12][i] = (distributions[12][i] * 10000) / hybridTotal;
-                }
-            }
-            
-            // Conservative split (80-20 best two)
-            distributions[13] = new uint[](splitCount);
-            distributions[13][bestIndex] = 8000;
-            distributions[13][secondBestIndex] = 2000;
-            
-            // Aggressive exploration (60-25-15 top three)
-            if (splitCount >= 3) {
-                uint thirdBestIndex = 0;
-                uint thirdBestOutput = 0;
-                for (uint i = 0; i < splitCount; i++) {
-                    if (i != bestIndex && i != secondBestIndex && baseOutputs[i] > thirdBestOutput) {
-                        thirdBestOutput = baseOutputs[i];
-                        thirdBestIndex = i;
-                    }
-                }
-                
-                distributions[14] = new uint[](splitCount);
-                distributions[14][bestIndex] = 6000;
-                distributions[14][secondBestIndex] = 2500;
-                distributions[14][thirdBestIndex] = 1500;
-            }
-        }
-        
-        return distributions;
-    }
-
-    // Enhanced multi-hop route finding
-    function findBestMultiHopRouteAdvanced(
-        uint amountIn,
-        address inputToken,
-        address outputToken,
-        uint hops,
-        address[] memory forbiddenTokens
-    ) internal view returns (uint expectedOut, TradeRoute memory bestRoute) {
-        require(hops >= 2 && hops <= MAX_HOPS, "Invalid hop count");
-        require(inputToken != address(0) && outputToken != address(0), "Invalid token addresses");
-        require(amountIn > 0, "Amount must be greater than 0");
-
-        TradeRoute memory bestRouteLocal;
-        bestRouteLocal.inputToken = inputToken;
-        bestRouteLocal.outputToken = outputToken;
-        bestRouteLocal.hops = hops;
-        bestRouteLocal.splitRoutes = new Split[][](hops);
-        uint bestOutputLocal = 0;
-
-        // Get expanded list of intermediate tokens
-        address[] memory intermediates = getExpandedIntermediateTokens(inputToken, outputToken);
-        
-        // For each possible first hop token
-        for (uint i = 0; i < intermediates.length; i++) {
-            address firstHopToken = intermediates[i];
-            if (!isValidTokenForPath(firstHopToken, inputToken, outputToken)) continue;
-
-            // Get best splits for first hop using advanced method
-            uint firstHopOutput;
-            Split[] memory firstHopSplits;
-            (firstHopOutput, firstHopSplits) = findBestSplitForHopAdvanced(
-                amountIn,
-                inputToken,
-                firstHopToken,
-                forbiddenTokens
-            );
-            
-            if (firstHopOutput == 0 || firstHopSplits.length == 0) continue;
-            
-            if (hops == 2) {
-                // For 2-hop routes, find best second hop
-                uint secondHopOutput;
-                Split[] memory secondHopSplits;
-                (secondHopOutput, secondHopSplits) = findBestSplitForHopAdvanced(
-                    firstHopOutput,
-                    firstHopToken,
-                    outputToken,
-                    forbiddenTokens
-                );
-                
-                if (secondHopOutput > bestOutputLocal && secondHopSplits.length > 0) {
-                    bestOutputLocal = secondHopOutput;
-                    bestRouteLocal.splitRoutes[0] = firstHopSplits;
-                    bestRouteLocal.splitRoutes[1] = secondHopSplits;
-                }
-            } else {
-                // For 3+ hop routes, recurse
-                address[] memory newForbiddenTokens = new address[](forbiddenTokens.length + 1);
-                for (uint j = 0; j < forbiddenTokens.length; j++) {
-                    newForbiddenTokens[j] = forbiddenTokens[j];
-                }
-                newForbiddenTokens[forbiddenTokens.length] = firstHopToken;
-                
-                uint remainingOutput;
-                TradeRoute memory remainingRoute;
-                (remainingOutput, remainingRoute) = findBestMultiHopRouteAdvanced(
-                    firstHopOutput,
-                    firstHopToken,
-                    outputToken,
-                    hops - 1,
-                    newForbiddenTokens
-                );
-                
-                if (remainingOutput > bestOutputLocal && remainingRoute.hops > 0) {
-                    bestOutputLocal = remainingOutput;
-                    bestRouteLocal.splitRoutes[0] = firstHopSplits;
-                    for (uint k = 0; k < hops - 1 && k < remainingRoute.splitRoutes.length; k++) {
-                        bestRouteLocal.splitRoutes[k + 1] = remainingRoute.splitRoutes[k];
-                    }
-                }
-            }
-        }
-
-        return (bestOutputLocal, bestRouteLocal);
-    }
-
-    // Get expanded list of intermediate tokens with better coverage
-    function getExpandedIntermediateTokens(address inputToken, address outputToken) internal view returns (address[] memory) {
-        address[] memory common = getCommonIntermediates();
-        address[] memory stablecoins = getCommonStablecoins();
-        address[] memory whitelisted = getAllWhitelistedTokens();
-        
-        // Combine all lists with deduplication
-        address[] memory expanded = new address[](common.length + stablecoins.length + whitelisted.length + 2);
-        uint idx = 0;
-        
-        // Add common intermediates
-        for (uint i = 0; i < common.length; i++) {
-            if (common[i] != address(0)) {
-                expanded[idx++] = common[i];
-            }
-        }
-        
-        // Add stablecoins (with dedup check)
-        for (uint i = 0; i < stablecoins.length; i++) {
-            if (stablecoins[i] == address(0)) continue;
-            bool isDuplicate = false;
-            for (uint j = 0; j < idx; j++) {
-                if (expanded[j] == stablecoins[i]) {
-                    isDuplicate = true;
-                    break;
-                }
-            }
-            if (!isDuplicate) {
-                expanded[idx++] = stablecoins[i];
-            }
-        }
-        
-        // Add whitelisted tokens (with dedup check)
-        for (uint i = 0; i < whitelisted.length; i++) {
-            if (whitelisted[i] == address(0)) continue;
-            bool isDuplicate = false;
-            for (uint j = 0; j < idx; j++) {
-                if (expanded[j] == whitelisted[i]) {
-                    isDuplicate = true;
-                    break;
-                }
-            }
-            if (!isDuplicate) {
-                expanded[idx++] = whitelisted[i];
-            }
-        }
-        
-        // Add input and output tokens as potential intermediates
-        expanded[idx++] = inputToken;
-        expanded[idx++] = outputToken;
-        
-        // Create properly sized result array
-        address[] memory result = new address[](idx);
-        for (uint i = 0; i < idx; i++) {
-            result[i] = expanded[i];
-        }
-        
-        return result;
-    }
-
-    // Find arbitrage opportunities (circular routes)
-    function findBestArbitrageRoute(
-        uint amountIn,
-        address inputToken,
-        address outputToken
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        // Try triangular arbitrage: Input -> Intermediate -> Input -> Output
-        address[] memory intermediates = getExpandedIntermediateTokens(inputToken, outputToken);
-        
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = 3;
-        bestRoute.splitRoutes = new Split[][](3);
-        uint bestOutput = 0;
-        
-        for (uint i = 0; i < intermediates.length; i++) {
-            address intermediate = intermediates[i];
-            if (intermediate == inputToken || intermediate == outputToken || intermediate == address(0)) continue;
-            
-            // Route: Input -> Intermediate -> Input -> Output
-            uint intermediateAmount;
-            Split[] memory firstSplits;
-            (intermediateAmount, firstSplits) = findBestSplitForHopAdvanced(
-                amountIn,
-                inputToken,
-                intermediate,
-                new address[](0)
-            );
-            
-            if (intermediateAmount == 0 || firstSplits.length == 0) continue;
-            
-            uint backToInputAmount;
-            Split[] memory secondSplits;
-            (backToInputAmount, secondSplits) = findBestSplitForHopAdvanced(
-                intermediateAmount,
-                intermediate,
-                inputToken,
-                new address[](0)
-            );
-            
-            if (backToInputAmount == 0 || secondSplits.length == 0) continue;
-            
-            uint finalAmount;
-            Split[] memory thirdSplits;
-            (finalAmount, thirdSplits) = findBestSplitForHopAdvanced(
-                backToInputAmount,
-                inputToken,
-                outputToken,
-                new address[](0)
-            );
-            
-            if (finalAmount > bestOutput && thirdSplits.length > 0) {
-                bestOutput = finalAmount;
-                bestRoute.splitRoutes[0] = firstSplits;
-                bestRoute.splitRoutes[1] = secondSplits;
-                bestRoute.splitRoutes[2] = thirdSplits;
-            }
-        }
-        
-        return (bestOutput, bestRoute);
-    }
-
-    // Find best cross-router opportunities
-    function findBestCrossRouterRoute(
-        uint amountIn,
-        address inputToken,
-        address outputToken
-    ) internal view returns (uint expectedOut, TradeRoute memory route) {
-        // Try routes that use different routers for different hops to exploit price differences
-        address[] memory intermediates = getExpandedIntermediateTokens(inputToken, outputToken);
-        
-        TradeRoute memory bestRoute;
-        bestRoute.inputToken = inputToken;
-        bestRoute.outputToken = outputToken;
-        bestRoute.hops = 2;
-        bestRoute.splitRoutes = new Split[][](2);
-        uint bestOutput = 0;
-        
-        for (uint i = 0; i < intermediates.length; i++) {
-            address intermediate = intermediates[i];
-            if (intermediate == inputToken || intermediate == outputToken || intermediate == address(0)) continue;
-            
-            // Try all router combinations for two hops
-            for (uint r1 = 0; r1 < routers.length; r1++) {
-                if (routers[r1] == address(0)) continue;
-                
-                for (uint r2 = 0; r2 < routers.length; r2++) {
-                    if (routers[r2] == address(0)) continue;
-                    
-                    // First hop
-                    address[] memory firstPath = getPath(inputToken, intermediate);
-                    uint firstOutput = 0;
-                    
-                    try IUniswapV2Router02(routers[r1]).getAmountsOut(amountIn, firstPath) returns (uint[] memory res) {
-                        if (res.length > 1) firstOutput = res[res.length - 1];
-                    } catch {
-                        continue;
-                    }
-                    
-                    if (firstOutput == 0) continue;
-                    
-                    // Second hop
-                    address[] memory secondPath = getPath(intermediate, outputToken);
-                    uint secondOutput = 0;
-                    
-                    try IUniswapV2Router02(routers[r2]).getAmountsOut(firstOutput, secondPath) returns (uint[] memory res) {
-                        if (res.length > 1) secondOutput = res[res.length - 1];
-                    } catch {
-                        continue;
-                    }
-                    
-                    if (secondOutput > bestOutput) {
-                        bestOutput = secondOutput;
-                        
-                        bestRoute.splitRoutes[0] = new Split[](1);
-                        bestRoute.splitRoutes[0][0] = Split({
-                            router: routers[r1],
-                            percentage: 10000,
-                            path: firstPath
-                        });
-                        
-                        bestRoute.splitRoutes[1] = new Split[](1);
-                        bestRoute.splitRoutes[1][0] = Split({
-                            router: routers[r2],
-                            percentage: 10000,
-                            path: secondPath
-                        });
-                    }
-                }
-            }
-        }
-        
-        return (bestOutput, bestRoute);
+    function getCommonStablecoins() public pure returns (address[] memory) {
+        address[] memory stablecoins = new address[](4);
+        // Main stablecoins that typically have good liquidity
+        stablecoins[0] = address(0x88b8E2161DEDC77EF4ab7585569D2415a1C1055D); // Major stablecoin 1
+        stablecoins[1] = address(0xf817257fed379853cDe0fa4F97AB987181B1E5Ea); // Major stablecoin 2
+        stablecoins[2] = address(0x6B175474E89094C44Da98b954EedeAC495271d0F); // DAI
+        stablecoins[3] = address(0x0000000000085d4780B73119b644AE5ecd22b376); // TUSD
+        return stablecoins;
     }
 
     function getPath(address tokenIn, address tokenOut) internal view returns (address[] memory) {
@@ -3006,7 +1568,7 @@ contract MonBridgeDex {
         return (expectedOut, route);
     }
     
-    // Helper method to rank intermediate tokens by liquidity with preference for major tokens and stablecoins
+    // Helper method to rank intermediate tokens by liquidity
     function rankIntermediateTokens(
         address inputToken,
         address outputToken,
@@ -3022,7 +1584,7 @@ contract MonBridgeDex {
             rankedTokens[i] = intermediates[i];
         }
         
-        // Calculate enhanced liquidity scores with preference multipliers
+        // Calculate liquidity scores
         uint[] memory liquidityScores = new uint[](intermediates.length);
         
         for (uint i = 0; i < intermediates.length; i++) {
@@ -3032,33 +1594,13 @@ contract MonBridgeDex {
             uint liquidityWithInput = analyzeLiquidityDepth(inputToken, rankedTokens[i]);
             uint liquidityWithOutput = analyzeLiquidityDepth(rankedTokens[i], outputToken);
             
-            // Base score is the geometric mean of liquidity on both sides
-            uint baseScore = 0;
+            // Score is the geometric mean of liquidity on both sides
             if (liquidityWithInput > 0 && liquidityWithOutput > 0) {
-                baseScore = sqrt(liquidityWithInput * liquidityWithOutput);
+                liquidityScores[i] = sqrt(liquidityWithInput * liquidityWithOutput);
             }
-            
-            // Apply preference multipliers without excessive bias
-            uint preferenceMultiplier = 100; // Base 100%
-            
-            // WETH gets highest preference
-            if (rankedTokens[i] == WETH) {
-                preferenceMultiplier = 120; // 20% bonus
-            }
-            // Stablecoins get slight preference 
-            else if (isStablecoin(rankedTokens[i])) {
-                preferenceMultiplier = 110; // 10% bonus
-            }
-            // Major tokens get slight preference
-            else if (isMajorToken(rankedTokens[i])) {
-                preferenceMultiplier = 105; // 5% bonus
-            }
-            
-            // Apply the multiplier (divide by 100 to maintain scale)
-            liquidityScores[i] = (baseScore * preferenceMultiplier) / 100;
         }
         
-        // Sort tokens by enhanced score (bubble sort for simplicity)
+        // Sort tokens by liquidity score (bubble sort for simplicity)
         for (uint i = 0; i < rankedTokens.length; i++) {
             for (uint j = i + 1; j < rankedTokens.length; j++) {
                 if (liquidityScores[j] > liquidityScores[i]) {
