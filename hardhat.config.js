@@ -11,21 +11,41 @@ module.exports = {
     settings: {
       optimizer: {
         enabled: true,
-        runs: 200
+        runs: 10000000,
+        details: {
+          yul: true,
+          yulDetails: {
+            stackAllocation: true,
+            optimizerSteps: "dhfoDgvulfnTUtnIf"
+          }
+        }
       },
-      viaIR: true
+      viaIR: true,
+      outputSelection: {
+        "*": {
+          "*": ["evm.bytecode", "evm.deployedBytecode", "abi"]
+        }
+      },
+      metadata: {
+        bytecodeHash: "none"
+      }
     }
   },
+  allowUnlimitedContractSize: true,
   networks: {
     // Configure networks here. For example:
     hardhat: {
       // Local development network
+      allowUnlimitedContractSize: true,
+      blockGasLimit: 30000000
     },
     // Monad testnet configuration
     monad_testnet: {
       url: process.env.MONAD_TESTNET_RPC || "https://testnet-rpc.monad.xyz",
       chainId: 10143,
-      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+      gas: 30000000,
+      gasPrice: 20000000000
     }
   },
   paths: {
@@ -35,3 +55,4 @@ module.exports = {
     artifacts: "./artifacts"
   }
 };
+
