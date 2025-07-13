@@ -11,12 +11,12 @@ module.exports = {
     settings: {
       optimizer: {
         enabled: true,
-        runs: 10000000,
+        runs: 1,
         details: {
           yul: true,
           yulDetails: {
             stackAllocation: true,
-            optimizerSteps: "dhfoDgvulfnTUtnIf"
+            optimizerSteps: "dhfoDgvulfnTUtnIf[xarrscLMcCTUtTOntnfDIulLculVcul []]"
           }
         }
       },
