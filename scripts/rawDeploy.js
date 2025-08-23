@@ -1,9 +1,10 @@
+
 require("dotenv").config();
 const fs = require("fs");
 const { ethers } = require("ethers");
 
 async function main() {
-  const provider = new ethers.JsonRpcProvider(process.env.MONAD_TESTNET_RPC);
+  const provider = new ethers.providers.JsonRpcProvider(process.env.MONAD_TESTNET_RPC);
   const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
   const artifact = JSON.parse(fs.readFileSync("artifacts/contracts/MonBridgeDex.sol/MonBridgeDex.json", "utf8"));
@@ -17,9 +18,28 @@ async function main() {
   const contract = await factory.deploy(WETH_ADDRESS);
 
   console.log("Waiting for confirmation...");
-  await contract.deploymentTransaction().wait();
+  await contract.deployTransaction.wait();
 
-  console.log("✅ Deployed to:", contract.target);
+  console.log("✅ Deployed to:", contract.address);
+  
+  // Save deployment info
+  const deploymentInfo = {
+    contractAddress: contract.address,
+    transactionHash: contract.deployTransaction.hash,
+    timestamp: new Date().toISOString(),
+    wethAddress: WETH_ADDRESS
+  };
+  
+  // Create a deployments directory if it doesn't exist
+  if (!fs.existsSync("./deployments")) {
+    fs.mkdirSync("./deployments");
+  }
+  
+  fs.writeFileSync(
+    "./deployments/raw-deployment.json",
+    JSON.stringify(deploymentInfo, null, 2)
+  );
+  console.log("Deployment info saved to ./deployments/raw-deployment.json");
 }
 
 main().catch((err) => {
