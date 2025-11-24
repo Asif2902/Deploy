@@ -4,6 +4,8 @@ require('dotenv').config();
 
 async function main() {
   console.log("Starting deployment and configuration of MonBridgeDex contract...");
+  console.log("Network:", network.name);
+  console.log("Chain ID:", network.config.chainId);
 
   // Configuration
   const WETH_ADDRESS = "0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A";
