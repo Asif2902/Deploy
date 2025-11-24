@@ -1,0 +1,702 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MonBridgeDex Testing Interface</title>
+    <script src="https://cdn.ethers.io/lib/ethers-5.7.2.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            padding: 30px;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        .contract-address {
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 30px;
+            word-break: break-all;
+        }
+
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            background: #f9f9f9;
+        }
+
+        .section h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: 500;
+        }
+
+        input, textarea, select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        textarea {
+            min-height: 80px;
+            font-family: monospace;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .result {
+            margin-top: 15px;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .result.success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+
+        .result.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+
+        .result.info {
+            background: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+        }
+
+        .wallet-status {
+            text-align: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #e3f2fd;
+            border-radius: 8px;
+        }
+
+        .wallet-status.connected {
+            background: #d4edda;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .token-info {
+            padding: 10px;
+            background: white;
+            border-radius: 4px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MonBridgeDex Testing Interface</h1>
+        <div class="contract-address">Contract: <strong id="contractAddr">0xCaf314d407A2830Ee25690A916BdA43681287Ef2</strong></div>
+        
+        <div class="wallet-status" id="walletStatus">
+            <button id="connectWallet">Connect Wallet</button>
+            <div id="walletInfo" style="display:none; margin-top:10px;"></div>
+        </div>
+
+        <div class="grid">
+            <!-- Find Best Route Section -->
+            <div class="section">
+                <h2>🔍 Find Best Route</h2>
+                <div class="form-group">
+                    <label>Amount In (wei):</label>
+                    <input type="text" id="routeAmountIn" placeholder="e.g., 1000000000000000000">
+                </div>
+                <div class="form-group">
+                    <label>Input Token Address:</label>
+                    <input type="text" id="routeInputToken" placeholder="0x...">
+                </div>
+                <div class="form-group">
+                    <label>Output Token Address:</label>
+                    <input type="text" id="routeOutputToken" placeholder="0x...">
+                </div>
+                <button onclick="findBestRoute()">Find Best Route</button>
+                <div id="routeResult"></div>
+            </div>
+
+            <!-- Execute Swap Section -->
+            <div class="section">
+                <h2>💱 Execute Swap</h2>
+                <div class="form-group">
+                    <label>Amount In (wei):</label>
+                    <input type="text" id="swapAmountIn" placeholder="e.g., 1000000000000000000">
+                </div>
+                <div class="form-group">
+                    <label>Min Amount Out (wei):</label>
+                    <input type="text" id="swapMinOut" placeholder="e.g., 950000000000000000">
+                </div>
+                <div class="form-group">
+                    <label>Route (JSON from Find Best Route):</label>
+                    <textarea id="swapRoute" placeholder='{"inputToken":"0x...","outputToken":"0x...","hops":1,"splitRoutes":[[...]]}'></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Deadline (unix timestamp):</label>
+                    <input type="text" id="swapDeadline" placeholder="Auto-filled">
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="isETHSwap"> Sending ETH?
+                    </label>
+                </div>
+                <button onclick="executeSwap()">Execute Swap</button>
+                <div id="swapResult"></div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <!-- Get Routers Section -->
+            <div class="section">
+                <h2>📋 Get Routers</h2>
+                <button onclick="getRouters()">Fetch Routers</button>
+                <div id="routersResult"></div>
+            </div>
+
+            <!-- Add Routers Section -->
+            <div class="section">
+                <h2>➕ Add Routers</h2>
+                <div class="form-group">
+                    <label>Router Addresses (comma-separated):</label>
+                    <textarea id="addRoutersInput" placeholder="0x..., 0x..., 0x..."></textarea>
+                </div>
+                <button onclick="addRouters()">Add Routers</button>
+                <div id="addRoutersResult"></div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <!-- Whitelist Tokens Section -->
+            <div class="section">
+                <h2>✅ Whitelist Tokens</h2>
+                <div class="form-group">
+                    <label>Token Addresses (comma-separated):</label>
+                    <textarea id="whitelistInput" placeholder="0x..., 0x..., 0x..."></textarea>
+                </div>
+                <button onclick="whitelistTokens()">Whitelist Tokens</button>
+                <div id="whitelistResult"></div>
+            </div>
+
+            <!-- Check Whitelist Section -->
+            <div class="section">
+                <h2>🔎 Check Token Whitelist</h2>
+                <div class="form-group">
+                    <label>Token Address:</label>
+                    <input type="text" id="checkWhitelistInput" placeholder="0x...">
+                </div>
+                <button onclick="checkWhitelist()">Check Whitelist</button>
+                <div id="checkWhitelistResult"></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>⚙️ Configuration</h2>
+            <div class="form-group">
+                <label>Contract Address:</label>
+                <input type="text" id="configContractAddress" value="0xCaf314d407A2830Ee25690A916BdA43681287Ef2">
+            </div>
+            <button onclick="updateContractAddress()">Update Contract Address</button>
+        </div>
+    </div>
+
+    <script>
+        const CONTRACT_ABI = [
+            "function findBestRoute(uint256 amountIn, address inputToken, address outputToken) external view returns (tuple(address inputToken, address outputToken, uint256 hops, tuple(address router, uint256 percentage, address[] path)[][] splitRoutes) route, uint256 expectedOut)",
+            "function executeSwap(uint256 amountIn, uint256 amountOutMin, tuple(address inputToken, address outputToken, uint256 hops, tuple(address router, uint256 percentage, address[] path)[][] splitRoutes) route, uint256 deadline) external payable returns (uint256 amountOut)",
+            "function getRouters() external view returns (address[] memory)",
+            "function addRouters(address[] calldata _routers) external",
+            "function whitelistTokens(address[] calldata tokens) external",
+            "function isWhitelisted(address token) public view returns (bool)",
+            "function owner() public view returns (address)"
+        ];
+
+        let provider;
+        let signer;
+        let contract;
+        let contractAddress = "0xCaf314d407A2830Ee25690A916BdA43681287Ef2";
+
+        async function connectWallet() {
+            try {
+                if (typeof window.ethereum === 'undefined') {
+                    showResult('walletStatus', 'Please install MetaMask!', 'error');
+                    return;
+                }
+
+                await window.ethereum.request({ method: 'eth_requestAccounts' });
+                provider = new ethers.providers.Web3Provider(window.ethereum);
+                signer = provider.getSigner();
+                const address = await signer.getAddress();
+                const network = await provider.getNetwork();
+
+                document.getElementById('walletStatus').classList.add('connected');
+                document.getElementById('connectWallet').style.display = 'none';
+                document.getElementById('walletInfo').style.display = 'block';
+                document.getElementById('walletInfo').innerHTML = `
+                    <strong>Connected:</strong> ${address}<br>
+                    <strong>Network:</strong> ${network.name} (Chain ID: ${network.chainId})
+                `;
+
+                initContract();
+            } catch (error) {
+                showResult('walletStatus', `Connection failed: ${error.message}`, 'error');
+            }
+        }
+
+        function initContract() {
+            contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+        }
+
+        async function findBestRoute() {
+            const resultDiv = document.getElementById('routeResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Finding best route...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const amountIn = document.getElementById('routeAmountIn').value;
+                const inputToken = document.getElementById('routeInputToken').value;
+                const outputToken = document.getElementById('routeOutputToken').value;
+
+                if (!amountIn || !inputToken || !outputToken) {
+                    throw new Error('Please fill all fields');
+                }
+
+                const result = await contract.findBestRoute(
+                    amountIn,
+                    inputToken,
+                    outputToken
+                );
+
+                const routeData = {
+                    inputToken: result.route.inputToken,
+                    outputToken: result.route.outputToken,
+                    hops: result.route.hops.toNumber(),
+                    splitRoutes: result.route.splitRoutes.map(hop => 
+                        hop.map(split => ({
+                            router: split.router,
+                            percentage: split.percentage.toNumber(),
+                            path: split.path
+                        }))
+                    )
+                };
+
+                const output = `✅ SUCCESS!
+
+Expected Output: ${ethers.utils.formatEther(result.expectedOut)} tokens
+(${result.expectedOut.toString()} wei)
+
+Route Details:
+- Input Token: ${result.route.inputToken}
+- Output Token: ${result.route.outputToken}
+- Number of Hops: ${result.route.hops}
+
+Split Routes (copy for swap):
+${JSON.stringify(routeData, null, 2)}
+
+Full Route Breakdown:
+${result.route.splitRoutes.map((hop, i) => `
+Hop ${i + 1}:
+${hop.map((split, j) => `  Split ${j + 1}:
+    Router: ${split.router}
+    Percentage: ${split.percentage / 100}%
+    Path: ${split.path.join(' → ')}`).join('\n')}
+`).join('\n')}`;
+
+                showResult('routeResult', output, 'success');
+
+                // Auto-fill swap form
+                document.getElementById('swapRoute').value = JSON.stringify(routeData);
+                document.getElementById('swapMinOut').value = result.expectedOut.mul(95).div(100).toString(); // 5% slippage
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO FIND ROUTE
+
+Error: ${error.message}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. No liquidity available for this token pair
+2. Token addresses are invalid
+3. Amount is too small or too large
+4. No routers configured in the contract
+5. Network connection issue
+
+Debug Info:
+- Amount In: ${document.getElementById('routeAmountIn').value}
+- Input Token: ${document.getElementById('routeInputToken').value}
+- Output Token: ${document.getElementById('routeOutputToken').value}
+- Contract Address: ${contractAddress}`;
+
+                showResult('routeResult', errorMsg, 'error');
+            }
+        }
+
+        async function executeSwap() {
+            const resultDiv = document.getElementById('swapResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Executing swap...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const amountIn = document.getElementById('swapAmountIn').value;
+                const minOut = document.getElementById('swapMinOut').value;
+                const routeJSON = document.getElementById('swapRoute').value;
+                const isETH = document.getElementById('isETHSwap').checked;
+                
+                let deadline = document.getElementById('swapDeadline').value;
+                if (!deadline) {
+                    deadline = Math.floor(Date.now() / 1000) + 1800; // 30 minutes
+                    document.getElementById('swapDeadline').value = deadline;
+                }
+
+                if (!amountIn || !minOut || !routeJSON) {
+                    throw new Error('Please fill all fields');
+                }
+
+                const route = JSON.parse(routeJSON);
+
+                // First approve token if not ETH
+                if (!isETH) {
+                    resultDiv.innerHTML = '<div class="loading"></div> Approving token...';
+                    const tokenContract = new ethers.Contract(
+                        route.inputToken,
+                        ['function approve(address spender, uint256 amount) external returns (bool)'],
+                        signer
+                    );
+                    const approveTx = await tokenContract.approve(contractAddress, amountIn);
+                    await approveTx.wait();
+                }
+
+                resultDiv.innerHTML = '<div class="loading"></div> Executing swap...';
+
+                const tx = await contract.executeSwap(
+                    amountIn,
+                    minOut,
+                    route,
+                    deadline,
+                    { value: isETH ? amountIn : 0 }
+                );
+
+                resultDiv.innerHTML = '<div class="loading"></div> Waiting for confirmation...';
+                const receipt = await tx.wait();
+
+                const output = `✅ SWAP SUCCESSFUL!
+
+Transaction Hash: ${receipt.transactionHash}
+Block Number: ${receipt.blockNumber}
+Gas Used: ${receipt.gasUsed.toString()}
+
+Check on explorer:
+https://explorer.monad.xyz/tx/${receipt.transactionHash}
+
+Transaction Details:
+${JSON.stringify(receipt, null, 2)}`;
+
+                showResult('swapResult', output, 'success');
+
+            } catch (error) {
+                const errorMsg = `❌ SWAP FAILED
+
+Error: ${error.message}
+
+Reason: ${error.reason || 'Unknown'}
+
+Code: ${error.code || 'N/A'}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. Insufficient token approval
+2. Slippage tolerance too low (try increasing min amount out)
+3. Deadline expired
+4. Insufficient balance
+5. Route is no longer valid (prices changed)
+
+Debug Info:
+- Amount In: ${document.getElementById('swapAmountIn').value}
+- Min Out: ${document.getElementById('swapMinOut').value}
+- Is ETH: ${document.getElementById('isETHSwap').checked}
+- Deadline: ${document.getElementById('swapDeadline').value}`;
+
+                showResult('swapResult', errorMsg, 'error');
+            }
+        }
+
+        async function getRouters() {
+            const resultDiv = document.getElementById('routersResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Fetching routers...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const routers = await contract.getRouters();
+
+                const output = `✅ ROUTERS RETRIEVED
+
+Total Routers: ${routers.length}
+
+Router Addresses:
+${routers.map((r, i) => `${i + 1}. ${r}`).join('\n')}`;
+
+                showResult('routersResult', output, 'success');
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO GET ROUTERS
+
+Error: ${error.message}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}`;
+
+                showResult('routersResult', errorMsg, 'error');
+            }
+        }
+
+        async function addRouters() {
+            const resultDiv = document.getElementById('addRoutersResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Adding routers...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const input = document.getElementById('addRoutersInput').value;
+                const routers = input.split(',').map(r => r.trim()).filter(r => r);
+
+                if (routers.length === 0) {
+                    throw new Error('Please enter at least one router address');
+                }
+
+                const tx = await contract.addRouters(routers);
+                const receipt = await tx.wait();
+
+                const output = `✅ ROUTERS ADDED SUCCESSFULLY!
+
+Transaction Hash: ${receipt.transactionHash}
+Block Number: ${receipt.blockNumber}
+Routers Added: ${routers.length}
+
+Addresses:
+${routers.map((r, i) => `${i + 1}. ${r}`).join('\n')}`;
+
+                showResult('addRoutersResult', output, 'success');
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO ADD ROUTERS
+
+Error: ${error.message}
+
+Reason: ${error.reason || 'Unknown'}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. Not the contract owner
+2. Invalid router address format
+3. Maximum router limit reached`;
+
+                showResult('addRoutersResult', errorMsg, 'error');
+            }
+        }
+
+        async function whitelistTokens() {
+            const resultDiv = document.getElementById('whitelistResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Whitelisting tokens...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const input = document.getElementById('whitelistInput').value;
+                const tokens = input.split(',').map(t => t.trim()).filter(t => t);
+
+                if (tokens.length === 0) {
+                    throw new Error('Please enter at least one token address');
+                }
+
+                const tx = await contract.whitelistTokens(tokens);
+                const receipt = await tx.wait();
+
+                const output = `✅ TOKENS WHITELISTED SUCCESSFULLY!
+
+Transaction Hash: ${receipt.transactionHash}
+Block Number: ${receipt.blockNumber}
+Tokens Whitelisted: ${tokens.length}
+
+Addresses:
+${tokens.map((t, i) => `${i + 1}. ${t}`).join('\n')}`;
+
+                showResult('whitelistResult', output, 'success');
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO WHITELIST TOKENS
+
+Error: ${error.message}
+
+Reason: ${error.reason || 'Unknown'}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. Not the contract owner
+2. Invalid token address format`;
+
+                showResult('whitelistResult', errorMsg, 'error');
+            }
+        }
+
+        async function checkWhitelist() {
+            const resultDiv = document.getElementById('checkWhitelistResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Checking whitelist...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const token = document.getElementById('checkWhitelistInput').value;
+
+                if (!token) {
+                    throw new Error('Please enter a token address');
+                }
+
+                const isWhitelisted = await contract.isWhitelisted(token);
+
+                const output = `Token: ${token}
+Status: ${isWhitelisted ? '✅ WHITELISTED' : '❌ NOT WHITELISTED'}`;
+
+                showResult('checkWhitelistResult', output, isWhitelisted ? 'success' : 'info');
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO CHECK WHITELIST
+
+Error: ${error.message}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}`;
+
+                showResult('checkWhitelistResult', errorMsg, 'error');
+            }
+        }
+
+        function updateContractAddress() {
+            contractAddress = document.getElementById('configContractAddress').value;
+            document.getElementById('contractAddr').textContent = contractAddress;
+            if (signer) {
+                initContract();
+            }
+            alert('Contract address updated! Please reconnect wallet if already connected.');
+        }
+
+        function showResult(elementId, message, type) {
+            const element = document.getElementById(elementId);
+            element.className = `result ${type}`;
+            element.textContent = message;
+        }
+
+        document.getElementById('connectWallet').addEventListener('click', connectWallet);
+
+        // Auto-fill deadline
+        document.getElementById('swapDeadline').value = Math.floor(Date.now() / 1000) + 1800;
+    </script>
+</body>
+</html>
