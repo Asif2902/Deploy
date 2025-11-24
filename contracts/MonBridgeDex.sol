@@ -2510,72 +2510,34 @@ contract MonBridgeDex {
         TradeRoute calldata route,
         uint deadline
     ) external payable nonReentrant returns (uint amountOut) {
-        require(route.hops > 0 && route.hops <= MAX_HOPS, "Invalid hop count");
-        require(route.splitRoutes.length == route.hops, "Invalid route structure");
-        require(amountIn > 0, "Amount must be greater than 0");
-        require(route.inputToken != address(0) && route.outputToken != address(0), "Invalid tokens");
+        require(route.hops > 0, "Invalid hop count");
         require(deadline >= block.timestamp, "Deadline expired");
-        
-        // Gas limit check: Ensure we have enough gas for the operation
-        // Estimate: ~200k gas per hop with splits, plus overhead
-        uint estimatedGas = 300000 + (route.hops * 200000);
-        require(gasleft() >= estimatedGas, "Insufficient gas for route");
 
-        // Validate all intermediate tokens are whitelisted
+        // Validate routers only
         for (uint i = 0; i < route.hops; i++) {
             for (uint j = 0; j < route.splitRoutes[i].length; j++) {
-                Split memory split = route.splitRoutes[i][j];
-                require(split.router != address(0), "Invalid router");
-                require(split.path.length >= 2, "Invalid path length");
-
-                // Check all tokens in the path
-                for (uint k = 0; k < split.path.length; k++) {
-                    address token = split.path[k];
-                    require(token != address(0), "Invalid token in path");
-
-                    // Only allow input token or output token to appear anywhere in the path
-                    // All other intermediate tokens must be whitelisted
-                    if (token == route.inputToken || token == route.outputToken) {
-                        continue;
-                    } else {
-                        require(isWhitelisted(token), "Intermediate token not whitelisted");
-                    }
-                }
+                require(route.splitRoutes[i][j].router != address(0), "Invalid router");
             }
         }
 
         bool isETHInput = msg.value > 0;
 
-        // Handle ETH input
+        // Handle input transfer
         if (isETHInput) {
-            require(route.inputToken == WETH, "Input token must be WETH for ETH input");
-            require(msg.value == amountIn, "ETH amount doesn't match amountIn");
-
-            // Wrap ETH to WETH
+            require(msg.value == amountIn, "ETH amount mismatch");
             IWETH(WETH).deposit{value: amountIn}();
         } else {
-            require(IERC20(route.inputToken).transferFrom(msg.sender, address(this), amountIn), "Transfer failed");
+            IERC20(route.inputToken).transferFrom(msg.sender, address(this), amountIn);
         }
 
-        // Calculate fee with overflow protection
+        // Deduct fee
         uint fee = amountIn / FEE_DIVISOR;
         uint remainingAmount = amountIn - fee;
 
         if (isETHInput) {
-            // Check for overflow before adding
-            require(feeAccumulatedETH <= type(uint256).max - fee, "Fee accumulation overflow");
             feeAccumulatedETH += fee;
         } else {
-            // Check for overflow before adding
-            require(feeAccumulatedTokens[route.inputToken] <= type(uint256).max - fee, "Fee accumulation overflow");
             feeAccumulatedTokens[route.inputToken] += fee;
-        }
-
-        // Verify we have the expected balance after fee deduction
-        if (isETHInput) {
-            require(IERC20(WETH).balanceOf(address(this)) >= remainingAmount, "Insufficient WETH balance");
-        } else {
-            require(IERC20(route.inputToken).balanceOf(address(this)) >= remainingAmount, "Insufficient input token balance");
         }
 
         // Execute each hop
@@ -2584,245 +2546,60 @@ contract MonBridgeDex {
 
         for (uint hopIndex = 0; hopIndex < route.hops; hopIndex++) {
             Split[] memory splits = route.splitRoutes[hopIndex];
-            require(splits.length > 0 && splits.length <= MAX_SPLITS_PER_HOP, "Invalid split count");
-
-            // Validate intermediate tokens
-            if (hopIndex < route.hops - 1) {
-                address currentNextToken = splits[0].path[splits[0].path.length - 1];
-                for (uint i = 1; i < splits.length; i++) {
-                    require(
-                        splits[i].path[splits[i].path.length - 1] == currentNextToken,
-                        "Inconsistent paths in splits"
-                    );
-                }
-
-                // Check if intermediate token is whitelisted
-                if (currentNextToken != route.outputToken && currentNextToken != route.inputToken) {
-                    require(isWhitelisted(currentNextToken), "Intermediate token not whitelisted");
-                }
-            }
-
+            
             uint nextAmountOut = 0;
             address nextToken = splits[0].path[splits[0].path.length - 1];
-
             uint totalAllocated = 0;
-            uint successfulSplits = 0;
-            uint totalUsedAmount = 0;
 
-            // Validate total percentages add up correctly
-            uint totalPercentage = 0;
-            for (uint i = 0; i < splits.length; i++) {
-                if (splits[i].router != address(0)) {
-                    totalPercentage += splits[i].percentage;
-                }
-            }
-            require(totalPercentage == 10000, "Split percentages must equal 100%");
-
-            // Pre-calculate split amounts to handle rounding correctly
+            // Calculate split amounts
             uint[] memory splitAmounts = new uint[](splits.length);
             for (uint i = 0; i < splits.length; i++) {
-                if (splits[i].router == address(0) || splits[i].percentage == 0) {
-                    splitAmounts[i] = 0;
-                    continue;
-                }
-
                 if (i < splits.length - 1) {
-                    // Use checked math to prevent overflow
-                    uint percentageAmount = splits[i].percentage;
-                    require(percentageAmount <= 10000, "Invalid percentage");
-                    splitAmounts[i] = (amountOut * percentageAmount) / 10000;
+                    splitAmounts[i] = (amountOut * splits[i].percentage) / 10000;
                     totalAllocated += splitAmounts[i];
                 } else {
-                    // Last split gets remainder to ensure 100% usage and avoid rounding errors
-                    require(amountOut >= totalAllocated, "Allocated amount exceeds available");
                     splitAmounts[i] = amountOut - totalAllocated;
                 }
             }
 
+            // Execute splits
             for (uint splitIndex = 0; splitIndex < splits.length; splitIndex++) {
                 Split memory split = splits[splitIndex];
-                if (split.router == address(0) || split.percentage == 0) continue;
-
                 uint splitAmount = splitAmounts[splitIndex];
-                if (splitAmount == 0) continue;
                 
-                // Gas check: Ensure we have enough gas to complete this split
-                // Each split needs ~150k gas minimum
-                require(gasleft() >= 150000, "Insufficient gas for split");
+                if (splitAmount == 0) continue;
 
-                // Calculate minimum output for this split
-                uint splitMinAmountOut = 0; // 0 for non-final hops
-
-                // Only apply a minimum amount out on the final hop
-                if (hopIndex == route.hops - 1) {
-                    if (splits.length == 1) {
-                        splitMinAmountOut = amountOutMin;
-                    } else {
-                        if (amountOutMin == 0) {
-                            // Get the expected output for this split
-                            try IUniswapV2Router02(split.router).getAmountsOut(splitAmount, split.path) returns (uint[] memory res) {
-                                uint expectedSplitOut = res[res.length - 1];
-                                // Apply dynamic slippage
-                                splitMinAmountOut = calculateMinAmountOut(expectedSplitOut, currentToken, nextToken);
-                            } catch {
-                                // Use a conservative default (10% slippage)
-                                splitMinAmountOut = (splitAmount * 90) / 100;
-                            }
-                        } else {
-                            // Proportional slice of user's minAmountOut
-                            splitMinAmountOut = (amountOutMin * split.percentage) / 10000;
-                        }
-                    }
+                // Calculate min output
+                uint splitMinAmountOut = 0;
+                if (hopIndex == route.hops - 1 && amountOutMin > 0) {
+                    splitMinAmountOut = splits.length == 1 ? amountOutMin : (amountOutMin * split.percentage) / 10000;
                 }
 
-                // Execute the swap - always use WETH, never unwrap for splits
-                uint[] memory amountsOut;
-                bool swapSuccess = false;
+                // Approve and swap
+                IERC20(currentToken).approve(split.router, 0);
+                IERC20(currentToken).approve(split.router, splitAmount);
 
-                // Verify we have sufficient balance for this split
-                uint currentBalance = IERC20(currentToken).balanceOf(address(this));
-                if (currentBalance < splitAmount) {
-                    // Insufficient balance, skip this split
-                    continue;
-                }
+                uint[] memory amountsOut = IUniswapV2Router02(split.router).swapExactTokensForTokens(
+                    splitAmount,
+                    splitMinAmountOut,
+                    split.path,
+                    address(this),
+                    deadline
+                );
 
-                // Reset approval first (for non-standard tokens like USDT)
-                try IERC20(currentToken).approve(split.router, 0) {
-                    // Approval reset successful
-                } catch {
-                    // Some tokens don't require reset, continue
-                }
-
-                // Approve router
-                bool approvalSuccess = false;
-                try IERC20(currentToken).approve(split.router, splitAmount) returns (bool success) {
-                    approvalSuccess = success;
-                } catch {
-                    // Approval failed, skip this split
-                    continue;
-                }
-
-                if (!approvalSuccess) {
-                    continue;
-                }
-
-                // Verify approval was set correctly
-                uint allowance = IERC20(currentToken).allowance(address(this), split.router);
-                if (allowance < splitAmount) {
-                    // Approval didn't work as expected, skip this split
-                    continue;
-                }
-
-                // Execute appropriate swap
-                if (nextToken == WETH && hopIndex == route.hops - 1 && !isETHInput) {
-                    // Only use swapExactTokensForETH if explicitly needed for output
-                    try IUniswapV2Router02(split.router).swapExactTokensForETH(
-                        splitAmount,
-                        splitMinAmountOut, 
-                        split.path,
-                        address(this),
-                        deadline
-                    ) returns (uint[] memory amounts) {
-                        amountsOut = amounts;
-                        swapSuccess = true;
-                        totalUsedAmount += splitAmount;
-                    } catch {
-                        // Swap failed, skip this split
-                        continue;
-                    }
-                } else {
-                    // Use standard token-to-token swap (works for WETH too)
-                    try IUniswapV2Router02(split.router).swapExactTokensForTokens(
-                        splitAmount,
-                        splitMinAmountOut, 
-                        split.path,
-                        address(this),
-                        deadline
-                    ) returns (uint[] memory amounts) {
-                        amountsOut = amounts;
-                        swapSuccess = true;
-                        totalUsedAmount += splitAmount;
-                    } catch {
-                        // Swap failed, skip this split
-                        continue;
-                    }
-                }
-
-                if (swapSuccess && amountsOut.length > 0) {
-                    uint splitOutput = amountsOut[amountsOut.length - 1];
-                    // Validate split output is reasonable
-                    require(splitOutput > 0, "Split returned zero output");
-                    
-                    // Check for overflow before adding
-                    require(nextAmountOut <= type(uint256).max - splitOutput, "Output overflow in split aggregation");
-                    nextAmountOut += splitOutput;
-                    successfulSplits++;
-                }
+                nextAmountOut += amountsOut[amountsOut.length - 1];
             }
 
-            // Require at least one successful split
-            require(successfulSplits > 0, "All splits failed in hop");
-
-            // Verify we got meaningful output
-            require(nextAmountOut > 0, "Zero output from hop");
-            
-            // Verify the actual balance matches expected output
-            uint actualBalance = IERC20(nextToken).balanceOf(address(this));
-            require(actualBalance >= nextAmountOut, "Balance mismatch after hop");
-
-            // Update for next hop
             currentToken = nextToken;
             amountOut = nextAmountOut;
-
-            // Additional validation: ensure output is reasonable compared to input
-            // This helps catch edge cases where splits partially fail
-            if (hopIndex == 0) {
-                // For first hop, output should be at least some fraction of input
-                // Allow for fees and slippage, but catch catastrophic failures
-                require(amountOut > (remainingAmount / 100), "Output too low for first hop");
-            }
         }
 
-        // Verify minimum output amount if specified by user
-        if (amountOutMin > 0) {
-            require(amountOut >= amountOutMin, "Insufficient output amount");
-        }
-        
-        // Additional sanity check: output should be greater than zero
-        require(amountOut > 0, "Final output is zero");
-        
-        // Verify we actually have the output tokens
-        uint outputBalance = IERC20(route.outputToken).balanceOf(address(this));
-        require(outputBalance >= amountOut, "Insufficient output balance in contract");
-
-        if (route.outputToken == WETH) {
-            bool isETHOutput = false;
-            if (route.hops > 0 && route.splitRoutes.length > 0) {
-                Split[] memory lastHopSplits = route.splitRoutes[route.hops - 1];
-                if (lastHopSplits.length > 0) {
-                    for (uint i = 0; i < lastHopSplits.length; i++) {
-                        Split memory split = lastHopSplits[i];
-                        if (split.router != address(0) && split.path.length > 0) {
-                            if (split.path[split.path.length - 1] == WETH) {
-                                isETHOutput = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (isETHOutput) {
-                (bool success, ) = payable(msg.sender).call{value: amountOut}("");
-                require(success, "ETH transfer to user failed");
-            } else {
-                IWETH(WETH).withdraw(amountOut);
-                (bool success, ) = payable(msg.sender).call{value: amountOut}("");
-                require(success, "ETH transfer to user failed");
-            }
+        // Transfer output to user
+        if (route.outputToken == WETH && isETHInput) {
+            IWETH(WETH).withdraw(amountOut);
+            payable(msg.sender).transfer(amountOut);
         } else {
-            // Transfer tokens to user
-            require(IERC20(route.outputToken).transfer(msg.sender, amountOut), "Output transfer failed");
+            IERC20(route.outputToken).transfer(msg.sender, amountOut);
         }
 
         emit SwapExecuted(msg.sender, amountIn, amountOut);
