@@ -249,6 +249,21 @@
                 <button onclick="addRouters()">Add Routers</button>
                 <div id="addRoutersResult"></div>
             </div>
+
+            <!-- Remove Routers Section -->
+            <div class="section">
+                <h2>➖ Remove Routers</h2>
+                <div class="form-group">
+                    <label>Router Address (single):</label>
+                    <input type="text" id="removeRouterInput" placeholder="0x...">
+                </div>
+                <button onclick="removeRouter()">Remove Router</button>
+                <div id="removeRouterResult"></div>
+                <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #ddd;">
+                    <button onclick="removeAllRouters()" style="background: #dc3545;">Remove All Routers</button>
+                    <div id="removeAllRoutersResult"></div>
+                </div>
+            </div>
         </div>
 
         <div class="grid">
@@ -273,6 +288,17 @@
                 <button onclick="checkWhitelist()">Check Whitelist</button>
                 <div id="checkWhitelistResult"></div>
             </div>
+
+            <!-- Remove Whitelisted Tokens Section -->
+            <div class="section">
+                <h2>❌ Remove Whitelisted Tokens</h2>
+                <div class="form-group">
+                    <label>Token Addresses (comma-separated):</label>
+                    <textarea id="removeTokensInput" placeholder="0x..., 0x..., 0x..."></textarea>
+                </div>
+                <button onclick="removeTokensFromWhitelist()">Remove Tokens</button>
+                <div id="removeTokensResult"></div>
+            </div>
         </div>
 
         <div class="section">
@@ -291,7 +317,11 @@
             "function executeSwap(uint256 amountIn, uint256 amountOutMin, tuple(address inputToken, address outputToken, uint256 hops, tuple(address router, uint256 percentage, address[] path)[][] splitRoutes) route, uint256 deadline) external payable returns (uint256 amountOut)",
             "function getRouters() external view returns (address[] memory)",
             "function addRouters(address[] calldata _routers) external",
+            "function removeRouter(address _router) external",
+            "function removeAllRouters() external",
             "function whitelistTokens(address[] calldata tokens) external",
+            "function removeTokenFromWhitelist(address token) external",
+            "function removeTokensFromWhitelist(address[] calldata tokens) external",
             "function isWhitelisted(address token) public view returns (bool)",
             "function owner() public view returns (address)"
         ];
