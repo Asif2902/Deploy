@@ -1,10 +1,9 @@
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 
 interface IUniswapV2Router02 {
-    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+    function getAmountsOut(uint amountIn, address[] calldata path) view external returns (uint[] memory amounts);
     function swapExactETHForTokens(
         uint amountOutMin, 
         address[] calldata path, 
@@ -57,7 +56,7 @@ interface IWETH {
 contract MonBridgeDex {
     address public owner;
     address[] public routers;
-    uint public constant MAX_ROUTERS = 10;
+    uint public constant MAX_ROUTERS = 100;
     uint public constant MAX_HOPS = 4;
     uint public constant MAX_SPLITS_PER_HOP = 4;
 
@@ -71,7 +70,7 @@ contract MonBridgeDex {
     uint public constant SPLIT_THRESHOLD_BPS = 50;
 
     uint public constant FEE_DIVISOR = 1000; 
-    uint public feeAccumulatedETH;
+    uint feeAccumulatedETH;
     mapping(address => uint) public feeAccumulatedTokens;
     address public WETH;
 
@@ -2551,12 +2550,31 @@ contract MonBridgeDex {
             uint nextAmountOut = 0;
             address nextToken = splits[0].path[splits[0].path.length - 1];
 
+            uint totalAllocated = 0;
+            uint successfulSplits = 0;
+
+            // Pre-calculate split amounts to handle rounding correctly
+            uint[] memory splitAmounts = new uint[](splits.length);
+            for (uint i = 0; i < splits.length; i++) {
+                if (splits[i].router == address(0) || splits[i].percentage == 0) {
+                    splitAmounts[i] = 0;
+                    continue;
+                }
+
+                if (i < splits.length - 1) {
+                    splitAmounts[i] = (amountOut * splits[i].percentage) / 10000;
+                    totalAllocated += splitAmounts[i];
+                } else {
+                    // Last split gets remainder to ensure 100% usage
+                    splitAmounts[i] = amountOut - totalAllocated;
+                }
+            }
+
             for (uint splitIndex = 0; splitIndex < splits.length; splitIndex++) {
                 Split memory split = splits[splitIndex];
                 if (split.router == address(0) || split.percentage == 0) continue;
 
-                // Calculate amount for this split
-                uint splitAmount = (amountOut * split.percentage) / 10000;
+                uint splitAmount = splitAmounts[splitIndex];
                 if (splitAmount == 0) continue;
 
                 // Calculate minimum output for this split
@@ -2565,22 +2583,17 @@ contract MonBridgeDex {
                 // Only apply a minimum amount out on the final hop
                 if (hopIndex == route.hops - 1) {
                     if (splits.length == 1) {
-                        // If only one split in final hop, use the user-supplied minAmountOut
                         splitMinAmountOut = amountOutMin;
                     } else {
-                        // For multiple splits in final hop, calculate proportional minAmountOut
-                        // or use dynamically calculated value if amountOutMin is 0
                         if (amountOutMin == 0) {
                             // Get the expected output for this split
-                            uint[] memory amountsInner;
                             try IUniswapV2Router02(split.router).getAmountsOut(splitAmount, split.path) returns (uint[] memory res) {
-                                amountsInner = res;
-                                uint expectedSplitOut = amountsInner[amountsInner.length - 1];
+                                uint expectedSplitOut = res[res.length - 1];
                                 // Apply dynamic slippage
                                 splitMinAmountOut = calculateMinAmountOut(expectedSplitOut, currentToken, nextToken);
                             } catch {
-                                // Use a conservative default
-                                splitMinAmountOut = splitAmount / 2; // 50% slippage as fallback
+                                // Use a conservative default (10% slippage)
+                                splitMinAmountOut = (splitAmount * 90) / 100;
                             }
                         } else {
                             // Proportional slice of user's minAmountOut
@@ -2589,32 +2602,20 @@ contract MonBridgeDex {
                     }
                 }
 
-                // Execute the swap
+                // Execute the swap - always use WETH, never unwrap for splits
                 uint[] memory amountsOut;
+                bool swapSuccess = false;
 
-                // Handle ETH input in first hop
-                if (hopIndex == 0 && isETHInput) {
-                    // Unwrap WETH back to ETH for the swap
-                    IWETH(WETH).withdraw(splitAmount);
+                // Approve router
+                try IERC20(currentToken).approve(split.router, splitAmount) returns (bool) {
+                    // Approval succeeded, continue with swap
+                } catch {
+                    continue;
+                }
 
-                    // ETH to token swap
-                    try IUniswapV2Router02(split.router).swapExactETHForTokens{value: splitAmount}(
-                        splitMinAmountOut,
-                        split.path,
-                        address(this),
-                        deadline
-                    ) returns (uint[] memory amounts) {
-                        amountsOut = amounts;
-                    } catch {
-                        // If swap fails, skip this split
-                        continue;
-                    }
-                } 
-                else if (nextToken == WETH && hopIndex == route.hops - 1) {
-                    try IERC20(currentToken).approve(split.router, splitAmount) returns (bool) {} catch {
-                        continue;
-                    }
-
+                // Execute appropriate swap
+                if (nextToken == WETH && hopIndex == route.hops - 1 && !isETHInput) {
+                    // Only use swapExactTokensForETH if explicitly needed for output
                     try IUniswapV2Router02(split.router).swapExactTokensForETH(
                         splitAmount,
                         splitMinAmountOut, 
@@ -2623,16 +2624,12 @@ contract MonBridgeDex {
                         deadline
                     ) returns (uint[] memory amounts) {
                         amountsOut = amounts;
+                        swapSuccess = true;
                     } catch {
-                        // If swap fails, skip this split
                         continue;
                     }
-                } 
-                else {
-                    try IERC20(currentToken).approve(split.router, splitAmount) returns (bool) {} catch {
-                        continue;
-                    }
-
+                } else {
+                    // Use standard token-to-token swap (works for WETH too)
                     try IUniswapV2Router02(split.router).swapExactTokensForTokens(
                         splitAmount,
                         splitMinAmountOut, 
@@ -2641,16 +2638,20 @@ contract MonBridgeDex {
                         deadline
                     ) returns (uint[] memory amounts) {
                         amountsOut = amounts;
+                        swapSuccess = true;
                     } catch {
-                        // If swap fails, skip this split
                         continue;
                     }
                 }
 
-                if (amountsOut.length > 0) {
+                if (swapSuccess && amountsOut.length > 0) {
                     nextAmountOut += amountsOut[amountsOut.length - 1];
+                    successfulSplits++;
                 }
             }
+
+            // Require at least one successful split
+            require(successfulSplits > 0, "All splits failed in hop");
 
             // Update for next hop
             currentToken = nextToken;
