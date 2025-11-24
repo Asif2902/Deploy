@@ -1175,19 +1175,33 @@ contract MonBridgeDex {
         return directPath;
     }
 
-    function withdrawFeesETH() external onlyOwner {
+    function withdrawFeesETH() external onlyOwner nonReentrant {
         uint amount = feeAccumulatedETH;
         require(amount > 0, "No ETH fees");
+        
+        // CEI pattern: Check-Effects-Interactions
+        // Effects: Update state before external call
         feeAccumulatedETH = 0;
-        payable(owner).transfer(amount);
+        
+        // Interactions: External call last
+        (bool success, ) = payable(owner).call{value: amount}("");
+        require(success, "ETH transfer failed");
+        
         emit FeesWithdrawn(owner, amount);
     }
 
-    function withdrawFeesToken(address token) external onlyOwner {
+    function withdrawFeesToken(address token) external onlyOwner nonReentrant {
         uint amount = feeAccumulatedTokens[token];
         require(amount > 0, "No token fees");
+        require(token != address(0), "Invalid token address");
+        
+        // CEI pattern: Check-Effects-Interactions
+        // Effects: Update state before external call
         feeAccumulatedTokens[token] = 0;
+        
+        // Interactions: External call last
         require(IERC20(token).transfer(owner, amount), "Transfer failed");
+        
         emit TokenFeesWithdrawn(owner, token, amount);
     }
 
@@ -2476,6 +2490,11 @@ contract MonBridgeDex {
         require(amountIn > 0, "Amount must be greater than 0");
         require(route.inputToken != address(0) && route.outputToken != address(0), "Invalid tokens");
         require(deadline >= block.timestamp, "Deadline expired");
+        
+        // Gas limit check: Ensure we have enough gas for the operation
+        // Estimate: ~200k gas per hop with splits, plus overhead
+        uint estimatedGas = 300000 + (route.hops * 200000);
+        require(gasleft() >= estimatedGas, "Insufficient gas for route");
 
         // Validate all intermediate tokens are whitelisted
         for (uint i = 0; i < route.hops; i++) {
@@ -2513,13 +2532,17 @@ contract MonBridgeDex {
             require(IERC20(route.inputToken).transferFrom(msg.sender, address(this), amountIn), "Transfer failed");
         }
 
-        // Calculate fee
+        // Calculate fee with overflow protection
         uint fee = amountIn / FEE_DIVISOR;
         uint remainingAmount = amountIn - fee;
 
         if (isETHInput) {
+            // Check for overflow before adding
+            require(feeAccumulatedETH <= type(uint256).max - fee, "Fee accumulation overflow");
             feeAccumulatedETH += fee;
         } else {
+            // Check for overflow before adding
+            require(feeAccumulatedTokens[route.inputToken] <= type(uint256).max - fee, "Fee accumulation overflow");
             feeAccumulatedTokens[route.inputToken] += fee;
         }
 
@@ -2577,6 +2600,10 @@ contract MonBridgeDex {
 
                 uint splitAmount = splitAmounts[splitIndex];
                 if (splitAmount == 0) continue;
+                
+                // Gas check: Ensure we have enough gas to complete this split
+                // Each split needs ~150k gas minimum
+                require(gasleft() >= 150000, "Insufficient gas for split");
 
                 // Calculate minimum output for this split
                 uint splitMinAmountOut = 0; // 0 for non-final hops
