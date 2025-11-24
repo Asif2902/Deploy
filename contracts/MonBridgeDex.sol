@@ -2552,6 +2552,7 @@ contract MonBridgeDex {
 
             uint totalAllocated = 0;
             uint successfulSplits = 0;
+            uint totalUsedAmount = 0;
 
             // Pre-calculate split amounts to handle rounding correctly
             uint[] memory splitAmounts = new uint[](splits.length);
@@ -2565,7 +2566,7 @@ contract MonBridgeDex {
                     splitAmounts[i] = (amountOut * splits[i].percentage) / 10000;
                     totalAllocated += splitAmounts[i];
                 } else {
-                    // Last split gets remainder to ensure 100% usage
+                    // Last split gets remainder to ensure 100% usage and avoid rounding errors
                     splitAmounts[i] = amountOut - totalAllocated;
                 }
             }
@@ -2607,9 +2608,15 @@ contract MonBridgeDex {
                 bool swapSuccess = false;
 
                 // Approve router
-                try IERC20(currentToken).approve(split.router, splitAmount) returns (bool) {
-                    // Approval succeeded, continue with swap
+                bool approvalSuccess = false;
+                try IERC20(currentToken).approve(split.router, splitAmount) returns (bool success) {
+                    approvalSuccess = success;
                 } catch {
+                    // Approval failed, skip this split
+                    continue;
+                }
+
+                if (!approvalSuccess) {
                     continue;
                 }
 
@@ -2625,7 +2632,9 @@ contract MonBridgeDex {
                     ) returns (uint[] memory amounts) {
                         amountsOut = amounts;
                         swapSuccess = true;
+                        totalUsedAmount += splitAmount;
                     } catch {
+                        // Swap failed, skip this split
                         continue;
                     }
                 } else {
@@ -2639,7 +2648,9 @@ contract MonBridgeDex {
                     ) returns (uint[] memory amounts) {
                         amountsOut = amounts;
                         swapSuccess = true;
+                        totalUsedAmount += splitAmount;
                     } catch {
+                        // Swap failed, skip this split
                         continue;
                     }
                 }
@@ -2653,12 +2664,20 @@ contract MonBridgeDex {
             // Require at least one successful split
             require(successfulSplits > 0, "All splits failed in hop");
 
+            // Verify we got meaningful output
+            require(nextAmountOut > 0, "Zero output from hop");
+
             // Update for next hop
             currentToken = nextToken;
             amountOut = nextAmountOut;
 
-            // If we got 0 output from a hop, fail the transaction
-            require(amountOut > 0, "Zero output from hop");
+            // Additional validation: ensure output is reasonable compared to input
+            // This helps catch edge cases where splits partially fail
+            if (hopIndex == 0) {
+                // For first hop, output should be at least some fraction of input
+                // Allow for fees and slippage, but catch catastrophic failures
+                require(amountOut > (remainingAmount / 100), "Output too low for first hop");
+            }
         }
 
         // Verify minimum output amount if specified by user
