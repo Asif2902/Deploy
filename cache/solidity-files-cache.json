@@ -1,16 +1,16 @@
 {
   "_format": "hh-sol-cache-2",
   "files": {
-    "/project/workspace/contracts/MonBridgeDex.sol": {
-      "lastModificationDate": 1747921613757,
-      "contentHash": "697702a208763e48c51bcfc58a49fd80",
+    "/home/runner/workspace/contracts/MonBridgeDex.sol": {
+      "lastModificationDate": 1764001334642,
+      "contentHash": "4e9f54ee4e2d949090c807ffb86a34de",
       "sourceName": "contracts/MonBridgeDex.sol",
       "solcConfig": {
         "version": "0.8.18",
         "settings": {
           "optimizer": {
             "enabled": true,
-            "runs": 2000000000
+            "runs": 200
           },
           "viaIR": true,
           "outputSelection": {

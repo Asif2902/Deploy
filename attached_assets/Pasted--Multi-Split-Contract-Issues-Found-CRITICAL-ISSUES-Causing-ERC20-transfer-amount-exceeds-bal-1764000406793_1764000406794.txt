@@ -1,0 +1,230 @@
+# Multi-Split Contract Issues Found
+
+## CRITICAL ISSUES (Causing "ERC20: transfer amount exceeds balance" error)
+
+### 1. **ETH/MON Input with Multiple Splits - UNWRAP LOGIC BROKEN** (Lines 2596-2611)
+**Issue**: When input is ETH/MON with multiple splits, the contract unwraps WETH for each split individually, but after first split's swap executes, the WETH-to-ETH unwrap for subsequent splits fails or consumes incorrect amounts.
+
+**Problem Code**:
+```solidity
+if (hopIndex == 0 && isETHInput) {
+    IWETH(WETH).withdraw(splitAmount);  // Line 2598 - Unwraps for EACH split
+    try IUniswapV2Router02(split.router).swapExactETHForTokens{value: splitAmount}(...)
+}
+```
+
+**Why it fails**: 
+- Wraps ALL ETH to WETH once (line 2512)
+- For each split in the loop (line 2554), tries to unwrap its portion
+- After split1 uses its tokens, split2 tries to unwrap but WETH balance is corrupted or insufficient
+
+---
+
+### 2. **Split Execution Silently Fails Without Tracking** (Lines 2609, 2628, 2646)
+**Issue**: When a swap fails (approval fails or swap reverts), the code does `continue`, skipping that split. But:
+- The splitAmount input is already deducted conceptually (though not explicitly tracked)
+- The output from that split (0) is never added to nextAmountOut
+- This causes "insufficient balance" downstream
+
+**Problem Code**:
+```solidity
+try IERC20(currentToken).approve(split.router, splitAmount) returns (bool) {} catch {
+    continue;  // Line 2615, 2633 - Silently skips split without tracking loss
+}
+```
+
+---
+
+### 3. **Fee Deduction Causes Insufficient Balance for Swaps** (Lines 2518-2525)
+**Issue**: Fee is deducted from amountIn BEFORE splits are processed:
+```solidity
+uint fee = amountIn / FEE_DIVISOR;  // Line 2518
+uint remainingAmount = amountIn - fee;  // Line 2519
+amountOut = remainingAmount;  // Line 2529
+```
+
+Then in split loop:
+```solidity
+uint splitAmount = (amountOut * split.percentage) / 10000;  // Line 2559
+```
+
+**Problem**: If you have 2 splits at 50%-50%, and a 0.1% fee:
+- remainingAmount = amountIn * 0.999
+- split1 = remainingAmount * 50% 
+- split2 = remainingAmount * 50%
+- Total used = remainingAmount (correct)
+
+But if percentages don't add to 10000 due to rounding, some input is left unused, causing balance errors in multi-hop scenarios.
+
+---
+
+### 4. **Multi-Hop Accumulation Logic is Broken** (Lines 2531-2661)
+**Issue**: After each hop, `amountOut = nextAmountOut`. But if any split in that hop fails/is skipped:
+- nextAmountOut accumulates only successful splits
+- If all splits fail, nextAmountOut = 0
+- Line 2660 reverts: `require(amountOut > 0, "Zero output from hop");`
+- Contract can't recover from partial failures
+
+**Problem Code**:
+```solidity
+for (uint splitIndex = 0; splitIndex < splits.length; splitIndex++) {
+    // ... swap execution ...
+    if (amountsOut.length > 0) {
+        nextAmountOut += amountsOut[amountsOut.length - 1];  // Line 2651
+    }
+}
+// Update for next hop
+amountOut = nextAmountOut;  // Line 2657
+require(amountOut > 0, "Zero output from hop");  // Line 2660
+```
+
+---
+
+### 5. **Rounding Errors in Split Percentages** (Line 2559)
+**Issue**: When calculating splitAmount with percentages:
+```solidity
+uint splitAmount = (amountOut * split.percentage) / 10000;
+```
+
+If percentages are [3333, 3333, 3334] (totaling 10000), due to integer division:
+- split1 gets: (amountOut * 3333) / 10000
+- split2 gets: (amountOut * 3333) / 10000  
+- split3 gets: (amountOut * 3334) / 10000
+- Total: May be less than amountOut due to rounding
+
+This leftover amount causes issues in the next hop or final output.
+
+---
+
+## CRITICAL ISSUES (Logic Errors)
+
+### 6. **ETH Unwrap for Each Split with MON Input is Flawed** (Lines 2596-2611)
+**Specific problem with MON (which is WETH on Monad)**:
+
+When input is MON:
+1. Line 2512: Wraps all MON to WMON (WETH equivalent)
+2. Line 2598: For EACH split in the loop, tries to unwrap its share back to MON
+3. Line 2601: Executes swap with {value: splitAmount}
+
+**The issue**: If you have 3 splits [3500, 3000, 3500], it tries to:
+- Split1: Unwrap 3500 WMON → get 3500 MON → swap
+- Split2: Unwrap 3000 WMON → but WMON balance is now wrong after split1's swap
+- Split3: Tries to unwrap 3500 WMON → INSUFFICIENT BALANCE
+
+---
+
+### 7. **Final ETH/WETH Unwrap Logic Incorrect** (Lines 2668-2690)
+**Issue**: When output is WETH/MON:
+
+```solidity
+if (route.outputToken == WETH) {
+    // ... check logic to determine isETHOutput ...
+    if (isETHOutput) {
+        payable(msg.sender).transfer(amountOut);  // Line 2686
+    } else {
+        IWETH(WETH).withdraw(amountOut);  // Line 2688
+        payable(msg.sender).transfer(amountOut);  // Line 2689
+    }
+}
+```
+
+**Problems**:
+1. The isETHOutput detection (lines 2669-2683) checks if ANY path in last hop ends with WETH, but if there are multiple splits with different paths, this is ambiguous
+2. Line 2686 & 2689: Uses `.transfer()` which only allows 2300 gas - too little for most contracts. Should use `.call()` instead
+3. If all splits in final hop output different tokens, the logic breaks
+
+---
+
+### 8. **Inconsistent Token Tracking Across Splits** (Line 2656)
+**Issue**: After processing all splits in a hop:
+```solidity
+currentToken = nextToken;  // Line 2656
+```
+
+`nextToken` is taken from the LAST split's path. But if splits have different output tokens or paths, this is wrong. Multiple splits should converge to the same output token for the next hop.
+
+---
+
+## MODERATE ISSUES
+
+### 9. **No Validation That All Splits Output Same Token** (Lines 2536-2549)
+**Issue**: The code validates intermediate tokens are consistent (lines 2536-2543), but if there are multiple splits that output to different tokens, the contract breaks.
+
+### 10. **Gas Estimation Failed = Arbitrary Default** (Line 2583)
+**Issue**: If gas estimation fails for a split:
+```solidity
+splitMinAmountOut = splitAmount / 2;  // Line 2583 - 50% slippage fallback
+```
+
+This 50% fallback is arbitrary and might cause "insufficient output" errors on subsequent splits.
+
+### 11. **No Proper ETH Balance Verification** (Line 2509)
+**Issue**: 
+```solidity
+require(msg.value == amountIn, "ETH amount doesn't match amountIn");
+```
+
+But `amountIn` is passed as a parameter, not validated to match actual input. Should validate internally.
+
+---
+
+## ROOT CAUSE: Multi-Split with MON/ETH Doesn't Work
+
+The core issue is that **the contract architecture assumes**:
+- Single input token for all splits  
+- All splits in a hop output the same intermediate token
+- ETH can be unwrapped per-split without balance issues
+
+**But the implementation**:
+- Unwraps ETH for EACH split (causes balance exhaustion)
+- Doesn't properly track failed split execution
+- Doesn't validate split output token consistency
+- Uses arbitrary slippage fallbacks
+
+---
+
+## RECOMMENDED FIXES
+
+### Fix 1: Handle Multi-Split ETH Input Correctly
+Instead of unwrapping for each split, unwrap ONCE and send to router properly:
+```solidity
+// Wrap ALL ETH once
+IWETH(WETH).deposit{value: amountIn}();
+
+// For each split, just send WETH (not unwrap)
+IERC20(WETH).approve(split.router, splitAmount);
+IUniswapV2Router02(split.router).swapExactTokensForTokens(...)
+```
+
+### Fix 2: Track and Handle Failed Splits
+```solidity
+uint successfulSplits = 0;
+for (uint splitIndex = 0; splitIndex < splits.length; splitIndex++) {
+    // ... try swap ...
+    if (success) {
+        nextAmountOut += output;
+        successfulSplits++;
+    } else {
+        // Refund unused tokens to user or save for recovery
+    }
+}
+require(successfulSplits > 0, "All splits failed");
+```
+
+### Fix 3: Fix Rounding Errors
+```solidity
+uint totalAllocated = 0;
+for (uint i = 0; i < splits.length - 1; i++) {
+    splitAmount[i] = (amountOut * split.percentage) / 10000;
+    totalAllocated += splitAmount[i];
+}
+// Last split gets remainder to ensure 100% usage
+splitAmount[splits.length - 1] = amountOut - totalAllocated;
+```
+
+### Fix 4: Use Call Instead of Transfer for ETH
+```solidity
+(bool success, ) = payable(msg.sender).call{value: amountOut}("");
+require(success, "ETH transfer failed");
+```
+
