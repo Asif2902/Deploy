@@ -24,7 +24,7 @@ module.exports = {
     // Monad Mainnet configuration
     monad_mainnet: {
       url: process.env.MONAD_MAINNET_RPC || "https://rpc1.monad.xyz",
-      chainId: 41454,
+      chainId: 143,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
     }
   },
