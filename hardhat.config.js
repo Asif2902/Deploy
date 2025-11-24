@@ -21,10 +21,10 @@ module.exports = {
     hardhat: {
       // Local development network
     },
-    // Monad testnet configuration
-    monad_testnet: {
-      url: process.env.MONAD_TESTNET_RPC || "https://testnet-rpc.monad.xyz",
-      chainId: 10143,
+    // Monad Mainnet configuration
+    monad_mainnet: {
+      url: process.env.MONAD_MAINNET_RPC || "https://rpc1.monad.xyz",
+      chainId: 41454,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
     }
   },

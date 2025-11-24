@@ -11,7 +11,7 @@ async function main() {
   const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
 
   // Get the WETH address from environment variables or use default
-  const WETH_ADDRESS = process.env.WETH_ADDRESS || "0x760AfE86e5de5fa0Ee542fc7B7B713e1c5425701";
+  const WETH_ADDRESS = process.env.WETH_ADDRESS || "0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A";
   
   console.log("Deploying MonBridgeDex...");
   console.log(`Using WETH address: ${WETH_ADDRESS}`);
