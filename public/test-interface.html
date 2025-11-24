@@ -176,7 +176,7 @@
     <div class="container">
         <h1>MonBridgeDex Testing Interface</h1>
         <div class="contract-address">Contract: <strong id="contractAddr">0xCaf314d407A2830Ee25690A916BdA43681287Ef2</strong></div>
-        
+
         <div class="wallet-status" id="walletStatus">
             <button id="connectWallet">Connect Wallet</button>
             <div id="walletInfo" style="display:none; margin-top:10px;"></div>
@@ -231,6 +231,49 @@
             </div>
         </div>
 
+        <div class="grid">
+            <!-- Get Routers Section -->
+            <div class="section">
+                <h2>📋 Get Routers</h2>
+                <button onclick="getRouters()">Fetch Routers</button>
+                <div id="routersResult"></div>
+            </div>
+
+            <!-- Add Routers Section -->
+            <div class="section">
+                <h2>➕ Add Routers</h2>
+                <div class="form-group">
+                    <label>Router Addresses (comma-separated):</label>
+                    <textarea id="addRoutersInput" placeholder="0x..., 0x..., 0x..."></textarea>
+                </div>
+                <button onclick="addRouters()">Add Routers</button>
+                <div id="addRoutersResult"></div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <!-- Whitelist Tokens Section -->
+            <div class="section">
+                <h2>✅ Whitelist Tokens</h2>
+                <div class="form-group">
+                    <label>Token Addresses (comma-separated):</label>
+                    <textarea id="whitelistInput" placeholder="0x..., 0x..., 0x..."></textarea>
+                </div>
+                <button onclick="whitelistTokens()">Whitelist Tokens</button>
+                <div id="whitelistResult"></div>
+            </div>
+
+            <!-- Check Whitelist Section -->
+            <div class="section">
+                <h2>🔎 Check Token Whitelist</h2>
+                <div class="form-group">
+                    <label>Token Address:</label>
+                    <input type="text" id="checkWhitelistInput" placeholder="0x...">
+                </div>
+                <button onclick="checkWhitelist()">Check Whitelist</button>
+                <div id="checkWhitelistResult"></div>
+            </div>
+        </div>
 
         <div class="section">
             <h2>⚙️ Configuration</h2>
@@ -246,6 +289,10 @@
         const CONTRACT_ABI = [
             "function findBestRoute(uint256 amountIn, address inputToken, address outputToken) external view returns (tuple(address inputToken, address outputToken, uint256 hops, tuple(address router, uint256 percentage, address[] path)[][] splitRoutes) route, uint256 expectedOut)",
             "function executeSwap(uint256 amountIn, uint256 amountOutMin, tuple(address inputToken, address outputToken, uint256 hops, tuple(address router, uint256 percentage, address[] path)[][] splitRoutes) route, uint256 deadline) external payable returns (uint256 amountOut)",
+            "function getRouters() external view returns (address[] memory)",
+            "function addRouters(address[] calldata _routers) external",
+            "function whitelistTokens(address[] calldata tokens) external",
+            "function isWhitelisted(address token) public view returns (bool)",
             "function owner() public view returns (address)"
         ];
 
@@ -387,7 +434,7 @@ Debug Info:
                 const minOut = document.getElementById('swapMinOut').value;
                 const routeJSON = document.getElementById('swapRoute').value;
                 const isETH = document.getElementById('isETHSwap').checked;
-                
+
                 let deadline = document.getElementById('swapDeadline').value;
                 if (!deadline) {
                     deadline = Math.floor(Date.now() / 1000) + 1800; // 30 minutes
@@ -468,6 +515,149 @@ Debug Info:
             }
         }
 
+        async function getRouters() {
+            const resultDiv = document.getElementById('routersResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Fetching routers...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const routers = await contract.getRouters();
+
+                const output = `✅ ROUTERS RETRIEVED
+
+Total Routers: ${routers.length}
+
+Router Addresses:
+${routers.map((r, i) => `${i + 1}. ${r}`).join('\n')}`;
+
+                showResult('routersResult', output, 'success');
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO GET ROUTERS
+
+Error: ${error.message}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}`;
+
+                showResult('routersResult', errorMsg, 'error');
+            }
+        }
+
+        async function addRouters() {
+            const resultDiv = document.getElementById('addRoutersResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Adding routers...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const input = document.getElementById('addRoutersInput').value;
+                const routers = input.split(',').map(r => r.trim()).filter(r => r);
+
+                if (routers.length === 0) {
+                    throw new Error('Please enter at least one router address');
+                }
+
+                const tx = await contract.addRouters(routers);
+                const receipt = await tx.wait();
+
+                const output = `✅ ROUTERS ADDED SUCCESSFULLY!
+
+Transaction Hash: ${receipt.transactionHash}
+Block Number: ${receipt.blockNumber}
+Routers Added: ${routers.length}
+
+Addresses:
+${routers.map((r, i) => `${i + 1}. ${r}`).join('\n')}`;
+
+                showResult('addRoutersResult', output, 'success');
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO ADD ROUTERS
+
+Error: ${error.message}
+
+Reason: ${error.reason || 'Unknown'}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. Not the contract owner
+2. Invalid router address format
+3. Maximum router limit reached`;
+
+                showResult('addRoutersResult', errorMsg, 'error');
+            }
+        }
+
+        async function whitelistTokens() {
+            const resultDiv = document.getElementById('whitelistResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Whitelisting tokens...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const input = document.getElementById('whitelistInput').value;
+                const tokens = input.split(',').map(t => t.trim()).filter(t => t);
+
+                if (tokens.length === 0) {
+                    throw new Error('Please enter at least one token address');
+                }
+
+                const tx = await contract.whitelistTokens(tokens);
+                const receipt = await tx.wait();
+
+                const output = `✅ TOKENS WHITELISTED SUCCESSFULLY!
+
+Transaction Hash: ${receipt.transactionHash}
+Block Number: ${receipt.blockNumber}
+Tokens Whitelisted: ${tokens.length}
+
+Addresses:
+${tokens.map((t, i) => `${i + 1}. ${t}`).join('\n')}`;
+
+                showResult('whitelistResult', output, 'success');
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO WHITELIST TOKENS
+
+Error: ${error.message}
+
+Reason: ${error.reason || 'Unknown'}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. Not the contract owner
+2. Invalid token address format`;
+
+                showResult('whitelistResult', errorMsg, 'error');
+            }
+        }
+
+        async function checkWhitelist() {
+            const resultDiv = document.getElementById('checkWhitelistResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Checking whitelist...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const token = document.getElementById('checkWhitelistInput').value;
+
+                if (!token) {
+                    throw new Error('Please enter a token address');
+                }
 
                 const isWhitelisted = await contract.isWhitelisted(token);
 
