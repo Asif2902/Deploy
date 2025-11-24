@@ -252,17 +252,13 @@
 
             <!-- Remove Routers Section -->
             <div class="section">
-                <h2>➖ Remove Routers</h2>
+                <h2>➖ Remove Router</h2>
                 <div class="form-group">
-                    <label>Router Address (single):</label>
+                    <label>Router Address:</label>
                     <input type="text" id="removeRouterInput" placeholder="0x...">
                 </div>
                 <button onclick="removeRouter()">Remove Router</button>
                 <div id="removeRouterResult"></div>
-                <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #ddd;">
-                    <button onclick="removeAllRouters()" style="background: #dc3545;">Remove All Routers</button>
-                    <div id="removeAllRoutersResult"></div>
-                </div>
             </div>
         </div>
 
@@ -289,15 +285,15 @@
                 <div id="checkWhitelistResult"></div>
             </div>
 
-            <!-- Remove Whitelisted Tokens Section -->
+            <!-- Remove Whitelisted Token Section -->
             <div class="section">
-                <h2>❌ Remove Whitelisted Tokens</h2>
+                <h2>❌ Remove Whitelisted Token</h2>
                 <div class="form-group">
-                    <label>Token Addresses (comma-separated):</label>
-                    <textarea id="removeTokensInput" placeholder="0x..., 0x..., 0x..."></textarea>
+                    <label>Token Address:</label>
+                    <input type="text" id="removeTokenInput" placeholder="0x...">
                 </div>
-                <button onclick="removeTokensFromWhitelist()">Remove Tokens</button>
-                <div id="removeTokensResult"></div>
+                <button onclick="removeTokenFromWhitelist()">Remove Token</button>
+                <div id="removeTokenResult"></div>
             </div>
         </div>
 
@@ -318,10 +314,8 @@
             "function getRouters() external view returns (address[] memory)",
             "function addRouters(address[] calldata _routers) external",
             "function removeRouter(address _router) external",
-            "function removeAllRouters() external",
             "function whitelistTokens(address[] calldata tokens) external",
             "function removeTokenFromWhitelist(address token) external",
-            "function removeTokensFromWhitelist(address[] calldata tokens) external",
             "function isWhitelisted(address token) public view returns (bool)",
             "function owner() public view returns (address)"
         ];
@@ -705,6 +699,98 @@ Stack Trace:
 ${error.stack || 'No stack trace available'}`;
 
                 showResult('checkWhitelistResult', errorMsg, 'error');
+            }
+        }
+
+        async function removeRouter() {
+            const resultDiv = document.getElementById('removeRouterResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Removing router...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const router = document.getElementById('removeRouterInput').value;
+
+                if (!router) {
+                    throw new Error('Please enter a router address');
+                }
+
+                const tx = await contract.removeRouter(router);
+                const receipt = await tx.wait();
+
+                const output = `✅ ROUTER REMOVED SUCCESSFULLY!
+
+Transaction Hash: ${receipt.transactionHash}
+Block Number: ${receipt.blockNumber}
+Router Address: ${router}`;
+
+                showResult('removeRouterResult', output, 'success');
+                document.getElementById('removeRouterInput').value = '';
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO REMOVE ROUTER
+
+Error: ${error.message}
+
+Reason: ${error.reason || 'Unknown'}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. Not the contract owner
+2. Invalid router address format
+3. Router not found`;
+
+                showResult('removeRouterResult', errorMsg, 'error');
+            }
+        }
+
+        async function removeTokenFromWhitelist() {
+            const resultDiv = document.getElementById('removeTokenResult');
+            resultDiv.innerHTML = '<div class="loading"></div> Removing token from whitelist...';
+
+            try {
+                if (!contract) {
+                    throw new Error('Please connect wallet first');
+                }
+
+                const token = document.getElementById('removeTokenInput').value;
+
+                if (!token) {
+                    throw new Error('Please enter a token address');
+                }
+
+                const tx = await contract.removeTokenFromWhitelist(token);
+                const receipt = await tx.wait();
+
+                const output = `✅ TOKEN REMOVED FROM WHITELIST SUCCESSFULLY!
+
+Transaction Hash: ${receipt.transactionHash}
+Block Number: ${receipt.blockNumber}
+Token Address: ${token}`;
+
+                showResult('removeTokenResult', output, 'success');
+                document.getElementById('removeTokenInput').value = '';
+
+            } catch (error) {
+                const errorMsg = `❌ FAILED TO REMOVE TOKEN FROM WHITELIST
+
+Error: ${error.message}
+
+Reason: ${error.reason || 'Unknown'}
+
+Stack Trace:
+${error.stack || 'No stack trace available'}
+
+Common Issues:
+1. Not the contract owner
+2. Invalid token address format
+3. Token not whitelisted`;
+
+                showResult('removeTokenResult', errorMsg, 'error');
             }
         }
 
