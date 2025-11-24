@@ -1097,11 +1097,16 @@ contract MonBridgeDex {
 
     function getPath(address tokenIn, address tokenOut) internal view returns (address[] memory) {
         // Input validation
-        if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut) {
-            address[] memory emptyPath = new address[](2);
-            emptyPath[0] = tokenIn;
-            emptyPath[1] = tokenOut;
-            return emptyPath;
+        if (tokenIn == address(0) || tokenOut == address(0)) {
+            // Return empty path for invalid inputs
+            return new address[](0);
+        }
+        
+        if (tokenIn == tokenOut) {
+            // Same token - return single element path
+            address[] memory samePath = new address[](1);
+            samePath[0] = tokenIn;
+            return samePath;
         }
 
         // Direct path
@@ -1723,6 +1728,11 @@ contract MonBridgeDex {
         if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut || amountIn == 0) {
             return (address(0), 0);
         }
+        
+        // Additional safety check for extremely small amounts that might cause precision issues
+        if (amountIn < 100) {
+            return (address(0), 0);
+        }
 
         bestAmountOut = 0;
         bestRouter = address(0);
@@ -1737,9 +1747,11 @@ contract MonBridgeDex {
             if (routers[i] == address(0)) continue;
 
             try IUniswapV2Router02(routers[i]).getAmountsOut(amountIn, directPath) returns (uint[] memory res) {
-                if (res.length > 1) {
+                // Validate response array
+                if (res.length > 1 && res.length == directPath.length) {
                     uint amountOut = res[res.length - 1];
-                    if (amountOut > bestAmountOut) {
+                    // Validate output is reasonable (not zero and not overflow)
+                    if (amountOut > 0 && amountOut < type(uint256).max / 2 && amountOut > bestAmountOut) {
                         bestAmountOut = amountOut;
                         bestRouter = routers[i];
                     }
@@ -1867,6 +1879,13 @@ contract MonBridgeDex {
         }
 
         require(splitRouters.length == splitPercentages.length, "Array length mismatch");
+        
+        // Validate total percentage
+        uint totalPercentage = 0;
+        for (uint i = 0; i < splitPercentages.length; i++) {
+            totalPercentage += splitPercentages[i];
+        }
+        require(totalPercentage <= 10000, "Total percentage exceeds 100%");
 
         totalOutput = 0;
         address[] memory path = getPath(tokenIn, tokenOut);
@@ -1877,10 +1896,16 @@ contract MonBridgeDex {
 
             uint routerAmountIn = (amountIn * splitPercentages[i]) / 10000;
             if (routerAmountIn == 0) continue;
+            
+            // Skip if amount is too small
+            if (routerAmountIn < 100) continue;
 
             try IUniswapV2Router02(splitRouters[i]).getAmountsOut(routerAmountIn, path) returns (uint[] memory amounts) {
-                if (amounts.length > 1) {
-                    totalOutput += amounts[amounts.length - 1];
+                if (amounts.length > 1 && amounts[amounts.length - 1] > 0) {
+                    // Check for overflow before adding
+                    if (totalOutput <= type(uint256).max - amounts[amounts.length - 1]) {
+                        totalOutput += amounts[amounts.length - 1];
+                    }
                 }
             } catch {
                 // Skip if router reverts
@@ -2546,6 +2571,13 @@ contract MonBridgeDex {
             feeAccumulatedTokens[route.inputToken] += fee;
         }
 
+        // Verify we have the expected balance after fee deduction
+        if (isETHInput) {
+            require(IERC20(WETH).balanceOf(address(this)) >= remainingAmount, "Insufficient WETH balance");
+        } else {
+            require(IERC20(route.inputToken).balanceOf(address(this)) >= remainingAmount, "Insufficient input token balance");
+        }
+
         // Execute each hop
         address currentToken = route.inputToken;
         amountOut = remainingAmount;
@@ -2577,6 +2609,15 @@ contract MonBridgeDex {
             uint successfulSplits = 0;
             uint totalUsedAmount = 0;
 
+            // Validate total percentages add up correctly
+            uint totalPercentage = 0;
+            for (uint i = 0; i < splits.length; i++) {
+                if (splits[i].router != address(0)) {
+                    totalPercentage += splits[i].percentage;
+                }
+            }
+            require(totalPercentage == 10000, "Split percentages must equal 100%");
+
             // Pre-calculate split amounts to handle rounding correctly
             uint[] memory splitAmounts = new uint[](splits.length);
             for (uint i = 0; i < splits.length; i++) {
@@ -2586,10 +2627,14 @@ contract MonBridgeDex {
                 }
 
                 if (i < splits.length - 1) {
-                    splitAmounts[i] = (amountOut * splits[i].percentage) / 10000;
+                    // Use checked math to prevent overflow
+                    uint percentageAmount = splits[i].percentage;
+                    require(percentageAmount <= 10000, "Invalid percentage");
+                    splitAmounts[i] = (amountOut * percentageAmount) / 10000;
                     totalAllocated += splitAmounts[i];
                 } else {
                     // Last split gets remainder to ensure 100% usage and avoid rounding errors
+                    require(amountOut >= totalAllocated, "Allocated amount exceeds available");
                     splitAmounts[i] = amountOut - totalAllocated;
                 }
             }
@@ -2634,6 +2679,20 @@ contract MonBridgeDex {
                 uint[] memory amountsOut;
                 bool swapSuccess = false;
 
+                // Verify we have sufficient balance for this split
+                uint currentBalance = IERC20(currentToken).balanceOf(address(this));
+                if (currentBalance < splitAmount) {
+                    // Insufficient balance, skip this split
+                    continue;
+                }
+
+                // Reset approval first (for non-standard tokens like USDT)
+                try IERC20(currentToken).approve(split.router, 0) {
+                    // Approval reset successful
+                } catch {
+                    // Some tokens don't require reset, continue
+                }
+
                 // Approve router
                 bool approvalSuccess = false;
                 try IERC20(currentToken).approve(split.router, splitAmount) returns (bool success) {
@@ -2644,6 +2703,13 @@ contract MonBridgeDex {
                 }
 
                 if (!approvalSuccess) {
+                    continue;
+                }
+
+                // Verify approval was set correctly
+                uint allowance = IERC20(currentToken).allowance(address(this), split.router);
+                if (allowance < splitAmount) {
+                    // Approval didn't work as expected, skip this split
                     continue;
                 }
 
@@ -2683,7 +2749,13 @@ contract MonBridgeDex {
                 }
 
                 if (swapSuccess && amountsOut.length > 0) {
-                    nextAmountOut += amountsOut[amountsOut.length - 1];
+                    uint splitOutput = amountsOut[amountsOut.length - 1];
+                    // Validate split output is reasonable
+                    require(splitOutput > 0, "Split returned zero output");
+                    
+                    // Check for overflow before adding
+                    require(nextAmountOut <= type(uint256).max - splitOutput, "Output overflow in split aggregation");
+                    nextAmountOut += splitOutput;
                     successfulSplits++;
                 }
             }
@@ -2693,6 +2765,10 @@ contract MonBridgeDex {
 
             // Verify we got meaningful output
             require(nextAmountOut > 0, "Zero output from hop");
+            
+            // Verify the actual balance matches expected output
+            uint actualBalance = IERC20(nextToken).balanceOf(address(this));
+            require(actualBalance >= nextAmountOut, "Balance mismatch after hop");
 
             // Update for next hop
             currentToken = nextToken;
@@ -2711,6 +2787,13 @@ contract MonBridgeDex {
         if (amountOutMin > 0) {
             require(amountOut >= amountOutMin, "Insufficient output amount");
         }
+        
+        // Additional sanity check: output should be greater than zero
+        require(amountOut > 0, "Final output is zero");
+        
+        // Verify we actually have the output tokens
+        uint outputBalance = IERC20(route.outputToken).balanceOf(address(this));
+        require(outputBalance >= amountOut, "Insufficient output balance in contract");
 
         if (route.outputToken == WETH) {
             bool isETHOutput = false;
@@ -2730,10 +2813,12 @@ contract MonBridgeDex {
             }
 
             if (isETHOutput) {
-                payable(msg.sender).transfer(amountOut);
+                (bool success, ) = payable(msg.sender).call{value: amountOut}("");
+                require(success, "ETH transfer to user failed");
             } else {
                 IWETH(WETH).withdraw(amountOut);
-                payable(msg.sender).transfer(amountOut);
+                (bool success, ) = payable(msg.sender).call{value: amountOut}("");
+                require(success, "ETH transfer to user failed");
             }
         } else {
             // Transfer tokens to user
